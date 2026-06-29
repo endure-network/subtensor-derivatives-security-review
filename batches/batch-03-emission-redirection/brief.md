@@ -61,6 +61,15 @@ of holding the short vs emission TAO gained elsewhere, net of the EMA half-life 
   their stake fraction of the other 126 subnets ⇒ likely unprofitable as a pure skim on large subnets; cheaper on small
   subnets but little emission to capture. **L2b (pruning sabotage)** is the sharper variant: tipping an already-near-min
   subnet below the prune threshold for ~a day could force its deregistration (cost-framed competitive sabotage).
-- **Next:** closed-form profitability model (depress + arbitrage cost vs captured redirected emission, swept over subnet
-  size × attacker capture fraction); ideally a `run_coinbase`-driven harness test. **Current read: LOW–MEDIUM** (mechanism
-  real; ~8h EMA + arbitrage throttle the skim; L2b sabotage of a weak subnet is the main residual concern). Not yet settled.
+- **Profitability — SETTLED (`tooling/sims/sim_l2_economics.py`):** the capacity cap (κ=0.05) bounds the max short to a
+  ~9.75% spot depression; at that max, best-case **redirected-emission / carry = 0.12–0.25** across finney subnets — i.e.
+  even ignoring arbitrage, the locked floor P, and the close spread, AND assuming the attacker captures 100% of the
+  redirected emission, the short's carry alone is **4–8× the benefit**. ⇒ **L2a is economically infeasible.** The κ cap +
+  decay/carry are the effective defense (not χ).
+
+## Verdict
+- **L2a (emission skim): LOW** — mechanism real, economically infeasible (carry 4–8× best-case benefit; κ cap bounds depression).
+- **L2b (pruning sabotage): LOW–MEDIUM** — niche: only tips an already-near-min subnet below the prune threshold (those
+  prune anyway), and immunity protects new subnets. Pre-launch.
+- **D-chi-moot: informational** — the derivatives' χ/`SubnetTaoFlow` flow-neutrality machinery defends a DEAD channel
+  (`get_shares_flow` is uncalled); the live emission channel is price-EMA, defended by the κ cap + slow EMA. Worth a one-line note to maintainers.

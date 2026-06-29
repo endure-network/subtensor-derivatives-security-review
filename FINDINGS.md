@@ -9,7 +9,7 @@ Keep this table current; detail lives in each batch dir. Severity per `METHODOLO
 | F-02 | Cold-EMA fresh-subnet window bypasses the capacity cap | MEDIUM | confirmed | No (pre-launch) | batch-02 | `poc_cold_ema_breaches_capacity_cap` (cap 119→399) |
 | F-02b | Cold-EMA long-side mirror | MEDIUM | in-progress (parallel agent) | No | batch-02 | `derivative_cold_ema.rs::long_open_cold_ema_live_alpha_bypasses_capacity_cap` (in worktree) |
 | C-rollback | Non-transactional decay/dereg rollback/atomicity | candidate | in-progress (parallel agent) | ? | — | `derivative_rollback.rs` (in worktree) |
-| C-L2 | Emission-redirection: sustained short depresses a subnet's EMA price ⇒ cuts its price-based emission share | LOW–MEDIUM (economics open) | mechanism confirmed; profitability TBD | No (shorts OFF) | batch-03 | `get_shares`→`get_shares_price_ema`; finney: −50% EMA ≈ 95 TAO/day; EMA half-life ~8h |
+| C-L2 | Emission-redirection: sustained short depresses a subnet's EMA price ⇒ cuts its price-based emission share | **LOW** (infeasible) | settled — mechanism real, uneconomical | No (shorts OFF) | batch-03 | `sim_l2_economics.py`: best-case redir/carry = 0.12–0.25 (κ cap bounds depression; carry 4–8× benefit) |
 | C-L2b | Pruning sabotage: sustained short tips a near-min subnet's EMA below the prune threshold ⇒ force its deregistration | LOW–MEDIUM (cost-framed) | candidate | No (shorts OFF) | batch-03 | `get_network_to_prune` selects lowest `get_moving_alpha_price`; prune-min ≈ 0.0033 |
 | D-chi-moot | Design: the derivatives' χ/`SubnetTaoFlow` flow-neutrality defends a DEAD channel (`get_shares_flow` uncalled); live emission is price-EMA based | informational | confirmed | n/a | batch-03 | `get_shares` calls only `get_shares_price_ema` |
 
