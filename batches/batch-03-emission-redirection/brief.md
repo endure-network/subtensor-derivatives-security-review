@@ -24,7 +24,43 @@ of holding the short vs emission TAO gained elsewhere, net of the EMA half-life 
 5. Severity: economic, cross-subnet; calibrate honestly (impact × reachability; note pre-launch).
 
 ## Log
-- (pending)
+### Grounding (code, confirmed)
+- Emission share is **purely price-EMA based**: `get_shares` (subnet_emissions.rs:354) calls ONLY
+  `get_shares_price_ema` (395). The flow path `get_shares_flow` (257) exists but is **not called** ⇒ dead.
+  ⇒ `emission_i = block_emission · (root_prop_i · priceEMA_i · (1−miner_burned_i)) / Σ_j(...)`,
+  `priceEMA_i = get_moving_alpha_price = SubnetMovingPrice`.
+- **L2 mechanism is real:** a short open does `decrease_provided_tao_reserve(N+E)` ⇒ `SubnetTAO`↓ ⇒ spot
+  `p=(w1/w2)(T/A)`↓ ⇒ `update_moving_price` samples it into the EMA over blocks ⇒ subnet i's share↓ ⇒ its TAO
+  emission is redirected to other subnets. A SUSTAINED open short biases this for as long as it's held.
+- **The derivative's χ flow-neutrality defense is MOOT here.** `record_derivative_inflow/outflow` write
+  `SubnetTaoFlow`, which only feeds the DEAD `get_shares_flow`. The live (price) channel is what the short moves,
+  and χ does not defend it. (Design note worth reporting regardless of severity.)
+- **Side-lead L2b (pruning sabotage):** `get_network_to_prune` (root.rs:598-629) selects the non-immune subnet with
+  the **lowest `get_moving_alpha_price`** for deregistration. A sustained short that depresses a rival subnet's EMA
+  below the field could force its **pruning/deregistration** — competitive sabotage, framed as cost not profit.
 
-## Result
-- (pending) — update `../../FINDINGS.md` (`C-L2`) when settled.
+### Open questions (to model/quantify)
+- L2a magnitude: short size → spot drop → EMA drop over `EMAPriceHalvingBlocks` → Δshare → TAO redirected/block ×
+  hold; the attacker captures only their stake fraction of other subnets. vs the short's carry + locked-floor +
+  price-impact cost. Is any regime net-profitable? (likely marginal unless attacker dominates other subnets.)
+- L2b cost: TAO/blocks to push a target EMA below the current prune-min and hold it until prune fires.
+- Harness feasibility: needs the real `run_coinbase`/`block_step` loop (the derivatives mock stubs emission). Assess
+  whether `run_coinbase` is drivable in the pallet test runtime, else quantify off finney numbers.
+
+## Result (interim — mechanism CONFIRMED; economics OPEN)
+- **Mechanism confirmed:** emission share ∝ priceEMA (`get_shares`→`get_shares_price_ema`; the flow path is dead).
+  A short ↓`SubnetTAO` ↓spot ↓priceEMA ↓share ↓emission, redirected to others. The derivatives' χ/`SubnetTaoFlow`
+  flow-neutrality defends the DEAD flow channel — a reportable **design observation**, not itself an exploit.
+- **Finney magnitude (probe_emission_params.py):** 127 priced subnets, Σprice 1.39; top subnet (net 64) ≈ 5.4% share
+  ≈ 195 TAO/day. Depressing a top subnet's EMA −10/−50/−90% redirects ≈ 18 / 95 / 174 TAO/day. Prune-min ≈ 0.0033.
+- **EMA speed (cost driver) — corrected:** `EMAPriceHalvingBlocks=201600` is the `b/(b+halving)` RAMP param; the actual
+  per-block smoothing is `SubnetMovingAlpha ≈ 3e-4`, so an established subnet's EMA half-life is ~2,300 blocks (**~8h**)
+  and ~88% of a sustained price move lands within ~1 day. ⇒ manipulation is hours-to-days, not weeks.
+- **Economics — OPEN:** depressing a TOP subnet's spot ~50% means removing ~half its reserve (~100k TAO for net 64)
+  and holding it ~a day+ against arbitrage (carry cost) to redirect ~95 TAO/day, of which the attacker captures only
+  their stake fraction of the other 126 subnets ⇒ likely unprofitable as a pure skim on large subnets; cheaper on small
+  subnets but little emission to capture. **L2b (pruning sabotage)** is the sharper variant: tipping an already-near-min
+  subnet below the prune threshold for ~a day could force its deregistration (cost-framed competitive sabotage).
+- **Next:** closed-form profitability model (depress + arbitrage cost vs captured redirected emission, swept over subnet
+  size × attacker capture fraction); ideally a `run_coinbase`-driven harness test. **Current read: LOW–MEDIUM** (mechanism
+  real; ~8h EMA + arbitrage throttle the skim; L2b sabotage of a weak subnet is the main residual concern). Not yet settled.
