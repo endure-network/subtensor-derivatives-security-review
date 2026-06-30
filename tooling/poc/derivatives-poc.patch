@@ -1,8 +1,8 @@
 diff --git a/pallets/subtensor/src/tests/derivatives.rs b/pallets/subtensor/src/tests/derivatives.rs
-index 2a02b13..10ab140 100644
+index 2a02b13..ca58edd 100644
 --- a/pallets/subtensor/src/tests/derivatives.rs
 +++ b/pallets/subtensor/src/tests/derivatives.rs
-@@ -2396,3 +2396,232 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
+@@ -2396,3 +2396,529 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
          );
      });
  }
@@ -233,5 +233,302 @@ index 2a02b13..10ab140 100644
 +        // The SAME over-cap open now SUCCEEDS — risk-limit bypass via the cold-EMA fallback.
 +        assert_ok!(SubtensorModule::open_short(RuntimeOrigin::signed(trader), U256::from(11), netuid, p, None));
 +        assert!(ShortPositions::<Test>::get(netuid, trader).is_some());
++    });
++}
++
++// ===========================================================================
++// PoC (FINDING-02 escalation probe): does the cold-EMA capacity bypass COMPOSE
++// into a value DRAIN via cross-state open/close?
++//
++// Thesis: on a fresh subnet the EMA is cold, so `short_t_ref` falls back to the
++// live reserve. PUMP it in-block with `add_stake` (the production path that moves
++// BOTH `SubnetTAO` = T_ref AND the swap reserves), open a short against the
++// inflated reserve (inflated retained proceeds N1), then UNPUMP with
++// `remove_stake` and cash-settle (`do_close_short_self`) at the restored reserve.
++// The buyback K1 is quoted at the restored (lower) reserve, so if N1(pumped) >
++// K1(restored) the trader keeps the gap.
++//
++// Honesty: pump/unpump are REAL staking swaps; the attacker P&L is the trader's
++// free-balance delta (add_stake/open/remove_stake/close all move it), decomposed
++// into short_leg (returned-P = N1-K1) and pump_loss (pump_in - unpump_out). The
++// table prints Tbase/Tpump/Trest to PROVE the pump actually moved T_ref (a raw
++// SwapInterface::swap does NOT; only staking syncs SubnetTAO). fee = 0 isolates
++// the engine math (best case for the attacker): no drain at fee = 0 ⇒ none net
++// of real fees.
++//
++//   net > 0  ⇒ cross-state DRAIN (would escalate F-02 toward HIGH).
++//   net <= 0 ⇒ cross-state composition is DEFENDED (F-02 stays MEDIUM cap-bypass).
++// ===========================================================================
++struct XState {
++    opened: bool,
++    closed: bool,
++    t_base: u64,
++    t_pumped: u64,
++    t_restored: u64,
++    n1: u64,
++    k1: u64,
++    pump_paid: i128,
++    unpump_recv: i128,
++    floor_paid: i128,
++    returned: i128,
++}
++
++impl XState {
++    fn short_leg(&self) -> i128 {
++        self.returned - self.floor_paid
++    }
++    fn pump_loss(&self) -> i128 {
++        self.pump_paid - self.unpump_recv
++    }
++    fn net(&self) -> i128 {
++        self.short_leg() - self.pump_loss()
++    }
++}
++
++fn cross_state_short_attack(
++    idx: u32,
++    t0: u64,
++    pump_tao: u64,
++    p_tao: u64,
++    fee: u16,
++    kappa_ppb: u64,
++) -> XState {
++    let owner_h = U256::from(100_000u64 + u64::from(idx) * 2);
++    let owner_c = U256::from(100_001u64 + u64::from(idx) * 2);
++    let netuid = add_dynamic_network(&owner_h, &owner_c);
++    setup_reserves(netuid, t(t0), AlphaBalance::from(t0));
++    let sa = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++    add_balance_to_coldkey_account(&sa, t(t0.saturating_mul(3)));
++    skew_pool(netuid, 1.0, fee);
++    SubtensorModule::set_shorts_enabled(true);
++    SubtensorModule::set_short_kappa_ppb(kappa_ppb);
++
++    let trader = U256::from(900_000u64 + u64::from(idx));
++    let pump_hot = U256::from(950_000u64 + u64::from(idx));
++    let short_hot = U256::from(980_000u64 + u64::from(idx));
++    register_ok_neuron(netuid, pump_hot, trader, 0);
++    add_balance_to_coldkey_account(
++        &trader,
++        t(pump_tao.saturating_add(p_tao).saturating_add(t0)),
++    );
++    assert_eq!(
++        SubtensorModule::get_moving_alpha_price(netuid),
++        0,
++        "cold-EMA precondition: T_ref must fall back to the live reserve"
++    );
++
++    let t_base = SubnetTAO::<Test>::get(netuid).to_u64();
++    let pumped = pump_tao > 0;
++
++    // PUMP via add_stake: moves SubnetTAO (= T_ref) AND the swap reserves together.
++    let mut pump_paid: i128 = 0;
++    if pumped {
++        let before = bal(&trader);
++        assert_ok!(SubtensorModule::add_stake(
++            RuntimeOrigin::signed(trader),
++            pump_hot,
++            netuid,
++            t(pump_tao)
++        ));
++        pump_paid = i128::from(before.saturating_sub(bal(&trader)));
++    }
++    let t_pumped = SubnetTAO::<Test>::get(netuid).to_u64();
++    assert!(
++        !pumped || t_pumped > t_base,
++        "pump must raise SubnetTAO (T_ref): {t_base} -> {t_pumped}"
++    );
++    assert_eq!(
++        SubtensorModule::get_moving_alpha_price(netuid),
++        0,
++        "EMA must stay cold through the in-block pump"
++    );
++    let staked =
++        SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(&pump_hot, &trader, netuid);
++    let n1 = SubtensorModule::quote_open_short(netuid, t(p_tao))
++        .map(|q| q.retained_proceeds.to_u64())
++        .unwrap_or(0);
++
++    // OPEN short at the pumped reserve; floor P leaves the trader's balance.
++    let b_open = bal(&trader);
++    let opened = SubtensorModule::open_short(
++        RuntimeOrigin::signed(trader),
++        short_hot,
++        netuid,
++        t(p_tao),
++        None,
++    )
++    .is_ok();
++    let floor_paid = if opened {
++        i128::from(b_open.saturating_sub(bal(&trader)))
++    } else {
++        0
++    };
++
++    // UNPUMP via remove_stake: sell the alpha back (lowers SubnetTAO, credits trader).
++    let mut unpump_recv: i128 = 0;
++    if pumped {
++        let before = bal(&trader);
++        if SubtensorModule::remove_stake(RuntimeOrigin::signed(trader), pump_hot, netuid, staked)
++            .is_ok()
++        {
++            unpump_recv = i128::from(bal(&trader).saturating_sub(before));
++        }
++    }
++    let t_restored = SubnetTAO::<Test>::get(netuid).to_u64();
++
++    // K1 at the restored reserve, then SELF-CLOSE (cash-settled).
++    let mut k1 = 0u64;
++    let mut closed = false;
++    let mut returned: i128 = 0;
++    if opened {
++        k1 = SubtensorModule::quote_close_short(&trader, netuid, 1_000_000_000)
++            .map(|q| q.est_buyback_cost.to_u64())
++            .unwrap_or(0);
++        let b_close = bal(&trader);
++        closed = SubtensorModule::do_close_short_self(
++            RuntimeOrigin::signed(trader),
++            netuid,
++            1_000_000_000,
++            None,
++        )
++        .is_ok();
++        if closed {
++            returned = i128::from(bal(&trader).saturating_sub(b_close));
++        }
++    }
++
++    XState {
++        opened,
++        closed,
++        t_base,
++        t_pumped,
++        t_restored,
++        n1,
++        k1,
++        pump_paid,
++        unpump_recv,
++        floor_paid,
++        returned,
++    }
++}
++
++#[test]
++fn poc_cold_ema_cross_state_short_self_close_drain() {
++    new_test_ext(1).execute_with(|| {
++        let t0 = 100_000 * TAO;
++        let pumps_tao = [0u64, 50_000, 200_000];
++        let inputs_tao = [1_000u64, 10_000, 50_000];
++        let mut idx = 0u32;
++        let mut worst: i128 = i128::MIN;
++        println!("[XSTATE] T0=A0=100k TAO  fee=0  kappa=0.9  (add_stake pump moves SubnetTAO = T_ref)");
++        println!("[XSTATE]  pump      P  open close  Tbase Tpump Trest       N1       K1  short_leg  pump_loss       net  [TAO]");
++        for &pump in pumps_tao.iter() {
++            for &p in inputs_tao.iter() {
++                let r = cross_state_short_attack(
++                    idx,
++                    t0,
++                    pump.saturating_mul(TAO),
++                    p.saturating_mul(TAO),
++                    0,
++                    900_000_000,
++                );
++                println!(
++                    "[XSTATE] {:>6} {:>6}  {:>4} {:>4}  {:>5} {:>5} {:>5} {:>8.1} {:>8.1} {:>10.1} {:>10.1} {:>9.1}",
++                    pump,
++                    p,
++                    r.opened,
++                    r.closed,
++                    r.t_base / TAO / 1000,
++                    r.t_pumped / TAO / 1000,
++                    r.t_restored / TAO / 1000,
++                    r.n1 as f64 / 1e9,
++                    r.k1 as f64 / 1e9,
++                    r.short_leg() as f64 / 1e9,
++                    r.pump_loss() as f64 / 1e9,
++                    r.net() as f64 / 1e9
++                );
++                if r.net() > worst {
++                    worst = r.net();
++                }
++                idx = idx.saturating_add(1);
++            }
++        }
++        println!(
++            "[XSTATE] WORST-CASE attacker net = {} rao ({:.3} TAO)",
++            worst,
++            worst as f64 / 1e9
++        );
++        // SOUND invariant: cross-state open/close must NOT let the attacker profit
++        // beyond rounding dust. A failure with a large positive `worst` is the
++        // cross-state DRAIN proof (and would escalate F-02 toward HIGH).
++        assert!(
++            worst <= i128::from(TAO),
++            "CROSS-STATE DRAIN: attacker netted {worst} rao ({:.3} TAO) via cold-EMA pumped-open / restored-close",
++            worst as f64 / 1e9
++        );
++    });
++}
++
++// The coarse sweep shows pump_loss/short_leg shrinks as the pump shrinks. AMM
++// round-trip slippage is second-order in trade size while the extracted gap is
++// first-order, so a SMALL pump is the attacker's best shot — this fine sweep
++// hunts that regime for the ratio crossing below 1.0 (a real drain).
++#[test]
++fn poc_cold_ema_cross_state_fine_pump_sweep() {
++    new_test_ext(1).execute_with(|| {
++        let t0 = 100_000 * TAO;
++        let pumps = [100u64, 500, 2_000, 10_000, 50_000];
++        let inputs = [1_000u64, 10_000];
++        let mut idx = 0u32;
++        let mut best: i128 = i128::MIN;
++        let mut best_at = (0u64, 0u64);
++        println!("[FINE]  pump      P  open close       N1       K1  short_leg  pump_loss  ratio       net  [TAO]");
++        for &p in inputs.iter() {
++            for &pump in pumps.iter() {
++                let r = cross_state_short_attack(
++                    idx,
++                    t0,
++                    pump.saturating_mul(TAO),
++                    p.saturating_mul(TAO),
++                    0,
++                    900_000_000,
++                );
++                let ratio = if r.short_leg() > 0 {
++                    r.pump_loss() as f64 / r.short_leg() as f64
++                } else {
++                    f64::NAN
++                };
++                println!(
++                    "[FINE] {:>6} {:>6}  {:>4} {:>4} {:>8.1} {:>8.1} {:>10.1} {:>10.1}  {:>5.3} {:>9.3}",
++                    pump,
++                    p,
++                    r.opened,
++                    r.closed,
++                    r.n1 as f64 / 1e9,
++                    r.k1 as f64 / 1e9,
++                    r.short_leg() as f64 / 1e9,
++                    r.pump_loss() as f64 / 1e9,
++                    ratio,
++                    r.net() as f64 / 1e9
++                );
++                if r.net() > best {
++                    best = r.net();
++                    best_at = (pump, p);
++                }
++                idx = idx.saturating_add(1);
++            }
++        }
++        println!(
++            "[FINE] BEST net = {:.3} TAO at pump={} P={}",
++            best as f64 / 1e9,
++            best_at.0,
++            best_at.1
++        );
++        assert!(
++            best <= i128::from(TAO),
++            "FINE-SWEEP DRAIN: best net {best} rao at pump={} P={}",
++            best_at.0,
++            best_at.1
++        );
 +    });
 +}

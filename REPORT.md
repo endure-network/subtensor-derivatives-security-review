@@ -116,8 +116,11 @@ This is exactly the sandwich `sandwich_open_cannot_breach_capacity_cap` proves I
 It re-enables a known attack class the authors explicitly defend for warm subnets, but it is **pre-launch**,
 **fresh-subnet-scoped** (only during EMA warmup, before the subnet starts emitting), and it is a **risk-limit
 bypass, not a direct drain** — at the live 0.5/0.5 baseline `K0=N`, so an oversized cold-window position still
-returns ~`P` on self-close (no minting). **Open follow-up:** whether the cold window composes into a cross-state
-drain (open at a pumped reserve / close at the restored reserve) was not settled; the proven result is the cap bypass.
+returns ~`P` on self-close (no minting). **Cross-state escalation — settled (batch-06), not a drain:** opening at an
+in-block-pumped reserve and cash-settling at the restored reserve yields a *real* `N1−K1` gap (up to +33.5k TAO in the
+PoC), but the staking round-trip (`add_stake`/`remove_stake`) that manufactures the price move costs strictly more than
+the gap at every size (`pump_loss/short_leg → 1.0⁺`; best net −0.001 TAO). So F-02 stays MEDIUM and does **not**
+escalate to direct theft. PoC: `poc_cold_ema_cross_state_short_self_close_drain`, `poc_cold_ema_cross_state_fine_pump_sweep`.
 
 ### Recommended fix
 Seed `SubnetAlphaInMovingReserve` (and the price EMA) at **subnet creation**, mirroring the migration's seeding for

@@ -8,8 +8,10 @@ Pursue, refine, or **disprove**. These are questions, not findings. Don't assume
   Needs the live coinbase loop (the mock stubs it). *(batch-03 is on this.)*
 - **Self-cover under skewed weights (F-01):** confirmed but dormant (mainnet 0.5/0.5). Any path to `w≠0.5` re-arms it.
 - **Cross-state manipulation:** open at one reserve/price state, close/settle at another (e.g. cold-EMA pump-open /
-  restore-close). Does the open(state A)/close(state B) asymmetry drain? The confirmed F-02 result is cap bypass;
-  drain composition remains unproven.
+  restore-close). **SETTLED (batch-06) — not a drain:** the open(pumped)/close(restored) asymmetry yields a *real*
+  `N1−K1` gap (≤ +33.5k TAO in the PoC), but the staking round-trip that manufactures the price move costs strictly
+  more than the gap at every size (ratio→1.0⁺; best net −0.001 TAO). Residual (expected-defended, not separately
+  reproduced): the long-side mirror and the regular `do_close_short` vehicle.
 - **Rounding/precision dust:** `mul_tao`/`mul_alpha` truncation across the ~12 legs; long partial-close chains; the
   aggregate-Σ vs per-position `exp` decay drift (the header claims "safe direction" — verify the sign by running it).
 
