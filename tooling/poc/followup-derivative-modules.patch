@@ -1,0 +1,437 @@
+diff --git a/pallets/subtensor/src/tests/derivative_cold_ema.rs b/pallets/subtensor/src/tests/derivative_cold_ema.rs
+new file mode 100644
+index 0000000..aff42ba
+--- /dev/null
++++ b/pallets/subtensor/src/tests/derivative_cold_ema.rs
+@@ -0,0 +1,60 @@
++#![allow(clippy::arithmetic_side_effects, clippy::unwrap_used)]
++
++use super::mock::*;
++use crate::*;
++use frame_support::{assert_noop, assert_ok};
++use sp_core::U256;
++use substrate_fixed::types::U64F64;
++use subtensor_runtime_common::{AlphaBalance, TaoBalance, Token};
++
++const TAO: u64 = 1_000_000_000;
++
++fn t(v: u64) -> TaoBalance {
++    TaoBalance::from(v)
++}
++
++#[test]
++fn long_open_cold_ema_live_alpha_bypasses_capacity_cap() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = add_dynamic_network(&U256::from(2), &U256::from(1));
++        setup_reserves(netuid, t(1_500 * TAO), AlphaBalance::from(1_000 * TAO));
++        let subnet_account = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++        add_balance_to_coldkey_account(&subnet_account, t(1_000_000 * TAO));
++        SubtensorModule::set_longs_enabled(true);
++        SubtensorModule::set_long_kappa_ppb(80_000_000);
++        assert_eq!(
++            SubnetAlphaInMovingReserve::<Test>::get(netuid),
++            U64F64::from_num(0)
++        );
++
++        let position_input = AlphaBalance::from(200 * TAO);
++        let trader = U256::from(10);
++        let hotkey = U256::from(11);
++        let stake = AlphaBalance::from(2_000_000 * TAO);
++        SubtensorModule::increase_stake_for_hotkey_and_coldkey_on_subnet(
++            &hotkey, &trader, netuid, stake,
++        );
++        SubnetAlphaOut::<Test>::mutate(netuid, |o| *o = o.saturating_add(stake));
++
++        assert_noop!(
++            SubtensorModule::open_long(
++                RuntimeOrigin::signed(trader),
++                hotkey,
++                netuid,
++                position_input,
++                None,
++            ),
++            Error::<Test>::LongCapacityExceeded
++        );
++
++        setup_reserves(netuid, t(1_500 * TAO), AlphaBalance::from(5_000 * TAO));
++        assert_ok!(SubtensorModule::open_long(
++            RuntimeOrigin::signed(trader),
++            hotkey,
++            netuid,
++            position_input,
++            None,
++        ));
++        assert!(LongPositions::<Test>::get(netuid, trader).is_some());
++    });
++}
+diff --git a/pallets/subtensor/src/tests/derivative_coldkey_swap.rs b/pallets/subtensor/src/tests/derivative_coldkey_swap.rs
+new file mode 100644
+index 0000000..213d416
+--- /dev/null
++++ b/pallets/subtensor/src/tests/derivative_coldkey_swap.rs
+@@ -0,0 +1,131 @@
++#![allow(clippy::arithmetic_side_effects, clippy::unwrap_used)]
++
++use super::mock::*;
++use crate::*;
++use frame_support::{assert_noop, assert_ok};
++use sp_core::U256;
++use substrate_fixed::types::{I96F32, U64F64};
++use subtensor_runtime_common::{AlphaBalance, NetUid, TaoBalance, Token};
++
++const TAO: u64 = 1_000_000_000;
++
++fn t(v: u64) -> TaoBalance {
++    TaoBalance::from(v)
++}
++
++fn setup_market() -> NetUid {
++    let owner_coldkey = U256::from(1);
++    let owner_hotkey = U256::from(2);
++    let netuid = add_dynamic_network(&owner_hotkey, &owner_coldkey);
++    setup_reserves(netuid, t(10_000 * TAO), AlphaBalance::from(10_000 * TAO));
++    let subnet_account = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++    add_balance_to_coldkey_account(&subnet_account, t(10_000 * TAO));
++    SubnetMovingPrice::<Test>::insert(netuid, I96F32::from_num(1.0));
++    SubnetAlphaInMovingReserve::<Test>::insert(netuid, U64F64::from_num(10_000 * TAO));
++    SubtensorModule::set_shorts_enabled(true);
++    SubtensorModule::set_short_kappa_ppb(900_000_000);
++    netuid
++}
++
++#[test]
++fn coldkey_swap_collision_orphans_short_aggregate() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market();
++        let old_coldkey = U256::from(10);
++        let new_coldkey = U256::from(20);
++        add_balance_to_coldkey_account(&old_coldkey, t(1_000 * TAO));
++        add_balance_to_coldkey_account(&new_coldkey, t(1_000 * TAO));
++
++        assert_ok!(SubtensorModule::open_short(
++            RuntimeOrigin::signed(new_coldkey),
++            U256::from(21),
++            netuid,
++            t(50 * TAO),
++            None,
++        ));
++        assert_ok!(SubtensorModule::open_short(
++            RuntimeOrigin::signed(old_coldkey),
++            U256::from(11),
++            netuid,
++            t(50 * TAO),
++            None,
++        ));
++
++        let aggregate_before = ShortAggregate::<Test>::get(netuid);
++        assert_eq!(ShortPositions::<Test>::iter_prefix(netuid).count(), 2);
++
++        assert_ok!(SubtensorModule::do_swap_coldkey(&old_coldkey, &new_coldkey));
++
++        let live_q: u64 = ShortPositions::<Test>::iter_prefix(netuid)
++            .map(|(_, position)| position.q_liability.to_u64())
++            .sum();
++
++        assert!(ShortPositions::<Test>::get(netuid, old_coldkey).is_none());
++        assert!(ShortPositions::<Test>::get(netuid, new_coldkey).is_some());
++        assert_eq!(ShortPositions::<Test>::iter_prefix(netuid).count(), 1);
++        assert_eq!(ShortPositionCount::<Test>::get(netuid), 1);
++        assert_eq!(ShortAggregate::<Test>::get(netuid), aggregate_before);
++        assert!(ShortAggregate::<Test>::get(netuid).q_sigma.to_u64() > live_q);
++    });
++}
++
++#[test]
++fn long_coldkey_swap_collision_is_blocked_by_staking_hotkey_guard() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market();
++        let old_coldkey = U256::from(30);
++        let new_coldkey = U256::from(40);
++        let old_hotkey = U256::from(31);
++        let new_hotkey = U256::from(41);
++        let input = AlphaBalance::from(50 * TAO);
++        SubtensorModule::set_longs_enabled(true);
++        SubtensorModule::set_long_kappa_ppb(900_000_000);
++
++        SubtensorModule::increase_stake_for_hotkey_and_coldkey_on_subnet(
++            &new_hotkey,
++            &new_coldkey,
++            netuid,
++            input,
++        );
++        SubnetAlphaOut::<Test>::mutate(netuid, |o| *o = o.saturating_add(input));
++        assert_ok!(SubtensorModule::open_long(
++            RuntimeOrigin::signed(new_coldkey),
++            new_hotkey,
++            netuid,
++            input,
++            None,
++        ));
++
++        SubtensorModule::increase_stake_for_hotkey_and_coldkey_on_subnet(
++            &old_hotkey,
++            &old_coldkey,
++            netuid,
++            input,
++        );
++        SubnetAlphaOut::<Test>::mutate(netuid, |o| *o = o.saturating_add(input));
++        assert_ok!(SubtensorModule::open_long(
++            RuntimeOrigin::signed(old_coldkey),
++            old_hotkey,
++            netuid,
++            input,
++            None,
++        ));
++
++        assert!(LongPositions::<Test>::get(netuid, new_coldkey).is_some());
++        assert!(LongPositions::<Test>::get(netuid, old_coldkey).is_some());
++        assert_eq!(
++            SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(
++                &new_hotkey,
++                &new_coldkey,
++                netuid,
++            ),
++            AlphaBalance::ZERO
++        );
++        assert!(!StakingHotkeys::<Test>::get(new_coldkey).is_empty());
++
++        assert_noop!(
++            SubtensorModule::do_swap_coldkey(&old_coldkey, &new_coldkey),
++            Error::<Test>::ColdKeyAlreadyAssociated
++        );
++    });
++}
+diff --git a/pallets/subtensor/src/tests/derivative_rollback.rs b/pallets/subtensor/src/tests/derivative_rollback.rs
+new file mode 100644
+index 0000000..c1090b1
+--- /dev/null
++++ b/pallets/subtensor/src/tests/derivative_rollback.rs
+@@ -0,0 +1,126 @@
++#![allow(clippy::arithmetic_side_effects, clippy::unwrap_used)]
++
++use super::mock::*;
++use crate::*;
++use frame_support::{assert_noop, assert_ok};
++use sp_core::U256;
++use substrate_fixed::types::{I96F32, U64F64};
++use subtensor_runtime_common::{AlphaBalance, NetUid, TaoBalance, Token};
++
++const TAO: u64 = 1_000_000_000;
++
++fn t(v: u64) -> TaoBalance {
++    TaoBalance::from(v)
++}
++
++fn bal(acc: &U256) -> u64 {
++    Balances::free_balance(acc).into()
++}
++
++fn custody_bal(netuid: NetUid) -> u64 {
++    bal(&SubtensorModule::short_custody_account(netuid))
++}
++
++fn setup_market(tao_reserve: u64, alpha_reserve: u64, price: f64) -> NetUid {
++    let owner_c = U256::from(1);
++    let owner_h = U256::from(2);
++    let netuid = add_dynamic_network(&owner_h, &owner_c);
++    setup_reserves(netuid, t(tao_reserve), AlphaBalance::from(alpha_reserve));
++    let subnet_account = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++    add_balance_to_coldkey_account(&subnet_account, t(tao_reserve));
++    SubnetMovingPrice::<Test>::insert(netuid, I96F32::from_num(price));
++    SubnetAlphaInMovingReserve::<Test>::insert(netuid, U64F64::from_num(alpha_reserve));
++    SubtensorModule::set_shorts_enabled(true);
++    SubtensorModule::set_short_kappa_ppb(900_000_000);
++    netuid
++}
++
++fn setup_long(tao_reserve: u64, alpha_reserve: u64, price: f64) -> NetUid {
++    let netuid = setup_market(tao_reserve, alpha_reserve, price);
++    SubtensorModule::set_longs_enabled(true);
++    SubtensorModule::set_long_kappa_ppb(900_000_000);
++    netuid
++}
++
++fn give_alpha(hotkey: U256, coldkey: U256, netuid: NetUid, q: AlphaBalance) {
++    SubtensorModule::increase_stake_for_hotkey_and_coldkey_on_subnet(&hotkey, &coldkey, netuid, q);
++    SubnetAlphaOut::<Test>::mutate(netuid, |o| *o = o.saturating_add(q));
++}
++
++#[test]
++fn short_open_slippage_failure_rolls_back_state() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market(1_000 * TAO, 1_000 * TAO, 1.0);
++        let trader = U256::from(10);
++        let hotkey = U256::from(11);
++        add_balance_to_coldkey_account(&trader, t(1_000 * TAO));
++
++        let trader_before = bal(&trader);
++        let pool_before = SubnetTAO::<Test>::get(netuid).to_u64();
++        let custody_before = custody_bal(netuid);
++        let issuance_before = TotalIssuance::<Test>::get().to_u64();
++
++        assert_noop!(
++            SubtensorModule::open_short(
++                RuntimeOrigin::signed(trader),
++                hotkey,
++                netuid,
++                t(100 * TAO),
++                Some(u64::MAX),
++            ),
++            Error::<Test>::SlippageExceeded
++        );
++
++        assert_eq!(bal(&trader), trader_before);
++        assert_eq!(SubnetTAO::<Test>::get(netuid).to_u64(), pool_before);
++        assert_eq!(custody_bal(netuid), custody_before);
++        assert_eq!(TotalIssuance::<Test>::get().to_u64(), issuance_before);
++        assert!(ShortPositions::<Test>::get(netuid, trader).is_none());
++    });
++}
++
++#[test]
++fn long_self_close_slippage_failure_rolls_back_state() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_long(1_000 * TAO, 1_000 * TAO, 1.0);
++        let trader = U256::from(10);
++        let hotkey = U256::from(11);
++        give_alpha(hotkey, trader, netuid, AlphaBalance::from(2_000 * TAO));
++
++        assert_ok!(SubtensorModule::open_long(
++            RuntimeOrigin::signed(trader),
++            hotkey,
++            netuid,
++            AlphaBalance::from(100 * TAO),
++            None,
++        ));
++
++        let stake_before =
++            SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(&hotkey, &trader, netuid)
++                .to_u64();
++        let alpha_in_before = SubnetAlphaIn::<Test>::get(netuid).to_u64();
++        let alpha_out_before = SubnetAlphaOut::<Test>::get(netuid).to_u64();
++        let pos_before = LongPositions::<Test>::get(netuid, trader).unwrap();
++
++        assert_noop!(
++            SubtensorModule::close_long_self(
++                RuntimeOrigin::signed(trader),
++                netuid,
++                1_000_000_000,
++                Some(u64::MAX),
++            ),
++            Error::<Test>::SlippageExceeded
++        );
++
++        let stake_after =
++            SubtensorModule::get_stake_for_hotkey_and_coldkey_on_subnet(&hotkey, &trader, netuid)
++                .to_u64();
++        assert_eq!(stake_after, stake_before);
++        assert_eq!(SubnetAlphaIn::<Test>::get(netuid).to_u64(), alpha_in_before);
++        assert_eq!(
++            SubnetAlphaOut::<Test>::get(netuid).to_u64(),
++            alpha_out_before
++        );
++        assert_eq!(LongPositions::<Test>::get(netuid, trader), Some(pos_before));
++    });
++}
+diff --git a/pallets/subtensor/src/tests/derivative_terminal_settlement.rs b/pallets/subtensor/src/tests/derivative_terminal_settlement.rs
+new file mode 100644
+index 0000000..36ab4fe
+--- /dev/null
++++ b/pallets/subtensor/src/tests/derivative_terminal_settlement.rs
+@@ -0,0 +1,81 @@
++#![allow(clippy::arithmetic_side_effects, clippy::unwrap_used)]
++
++use super::mock::*;
++use crate::derivatives::{ShortAgg, ShortPosition};
++use crate::*;
++use sp_core::U256;
++use substrate_fixed::types::{I64F64, I96F32, U64F64};
++use subtensor_runtime_common::{AlphaBalance, NetUid, TaoBalance, Token};
++
++const TAO: u64 = 1_000_000_000;
++
++fn t(v: u64) -> TaoBalance {
++    TaoBalance::from(v)
++}
++
++fn bal(acc: &U256) -> u64 {
++    Balances::free_balance(acc).into()
++}
++
++fn setup_market() -> NetUid {
++    let owner_coldkey = U256::from(1);
++    let owner_hotkey = U256::from(2);
++    let netuid = add_dynamic_network(&owner_hotkey, &owner_coldkey);
++    setup_reserves(netuid, t(10_000 * TAO), AlphaBalance::from(10_000 * TAO));
++    let subnet_account = SubtensorModule::get_subnet_account_id(netuid).unwrap();
++    add_balance_to_coldkey_account(&subnet_account, t(10_000 * TAO));
++    SubnetMovingPrice::<Test>::insert(netuid, I96F32::from_num(0.1));
++    SubnetAlphaInMovingReserve::<Test>::insert(netuid, U64F64::from_num(10_000 * TAO));
++    netuid
++}
++
++#[test]
++fn terminal_settlement_pays_identical_shorts_different_equity() {
++    new_test_ext(1).execute_with(|| {
++        let netuid = setup_market();
++        let first = U256::from(10);
++        let second = U256::from(20);
++        let position = ShortPosition {
++            hotkey: U256::from(30),
++            p_floor: t(1_500 * TAO),
++            q_liability: AlphaBalance::from(1_000 * TAO),
++            r_stored: TaoBalance::ZERO,
++            e_stored: t(500 * TAO),
++            b_stored: TaoBalance::ZERO,
++            omega_entry: I64F64::from_num(0),
++            last_active: 0,
++        };
++
++        ShortPositions::<Test>::insert(netuid, first, position.clone());
++        ShortPositions::<Test>::insert(netuid, second, position);
++        ShortPositionCount::<Test>::insert(netuid, 2);
++        ShortAggregate::<Test>::insert(
++            netuid,
++            ShortAgg {
++                r_sigma: TaoBalance::ZERO,
++                e_sigma: t(1_000 * TAO),
++                b_sigma: TaoBalance::ZERO,
++                q_sigma: AlphaBalance::from(2_000 * TAO),
++                omega: I64F64::from_num(0),
++            },
++        );
++        add_balance_to_coldkey_account(&SubtensorModule::short_custody_account(netuid), t(4_000 * TAO));
++
++        let first_before = bal(&first);
++        let second_before = bal(&second);
++
++        SubtensorModule::settle_shorts_on_dereg(netuid);
++
++        let first_equity = bal(&first) - first_before;
++        let second_equity = bal(&second) - second_before;
++        println!(
++            "[TERMINAL-ORDER] first equity = {first_equity} rao, second equity = {second_equity} rao"
++        );
++        assert!(
++            first_equity.abs_diff(second_equity) > TAO,
++            "identical positions settled too similarly: first={first_equity}, second={second_equity}"
++        );
++        assert!(ShortPositions::<Test>::get(netuid, first).is_none());
++        assert!(ShortPositions::<Test>::get(netuid, second).is_none());
++    });
++}
+diff --git a/pallets/subtensor/src/tests/mod.rs b/pallets/subtensor/src/tests/mod.rs
+index 71b9a89..a172003 100644
+--- a/pallets/subtensor/src/tests/mod.rs
++++ b/pallets/subtensor/src/tests/mod.rs
+@@ -5,6 +5,10 @@ mod claim_root;
+ mod coinbase;
+ mod consensus;
+ mod delegate_info;
++mod derivative_cold_ema;
++mod derivative_coldkey_swap;
++mod derivative_rollback;
++mod derivative_terminal_settlement;
+ mod derivatives;
+ mod emission;
+ mod ensure;

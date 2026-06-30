@@ -11,10 +11,13 @@ head `1a7aa37` (`feat/pool-borrowing-spec`, base `devnet-ready`, open/unmerged a
 | # | Finding | Severity | Live today? | Class |
 |---|---------|----------|-------------|-------|
 | 01 | Self-cover close prices the liability on a different curve than open ⇒ pool drain under non-0.5 Balancer weights | **MEDIUM** | No (all mainnet pools at 0.5/0.5) | Latent fund-loss / conservation break |
-| 02 | Cold-EMA fresh-subnet window bypasses the capacity cap (T_ref manipulation-resistance inactive during warmup) | **MEDIUM** | No (pre-launch) | Risk-limit bypass / hardening |
+| 02 | Cold-EMA fresh-subnet window bypasses short and long capacity caps | **MEDIUM** | No (pre-launch) | Risk-limit bypass / hardening |
+| 03 | Coldkey-swap destination collision can orphan short derivative aggregate state | **MEDIUM** | No (pre-launch) | Lifecycle/accounting integrity |
+| 04 | Short terminal settlement can pay identical positions different equity based on storage order | **MEDIUM** | No (pre-launch) | Terminal-settlement fairness/accounting |
 
-Both are **real, harness-confirmed code defects** that are currently **non-exploitable** due to operational state,
-and both should be fixed **before** `ShortsEnabled`/`LongsEnabled` are turned on.
+All four are **real, harness-confirmed code defects** in pre-launch derivative paths. They are currently
+non-exploitable on mainnet because `ShortsEnabled`/`LongsEnabled` are default-off and the affected feature is not live,
+but they should be fixed before any production enablement.
 
 ## Method
 
@@ -90,21 +93,22 @@ the `close_*_self` path under skewed weights (the existing weighted-conservation
 ## FINDING-02 — Cold-EMA fresh-subnet capacity-cap bypass (MEDIUM, hardening)
 
 ### Root cause
-`SubnetAlphaInMovingReserve` (the block-lagged `A_EMA` that the T_ref manipulation-resistance relies on) is written
+`SubnetAlphaInMovingReserve` (the block-lagged `A_EMA` that the T_ref/A_ref manipulation-resistance relies on) is written
 in only two places: a one-time migration that seeds **existing** subnets, and the per-block `update_moving_price`
 tick. **There is no initialization at subnet creation.** So a freshly-created dynamic subnet has `A_EMA = 0` and
 `pEMA = 0` until its EMA warms, and `short_t_ref = min(t_live, pEMA·A_EMA)` ([mod.rs L136-149]) falls back to the
-**live, in-block-manipulable** reserve (`long_a_ref` mirrors this). The crossover/sandwich manipulation-resistance
+**live, in-block-manipulable** reserve. `long_a_ref` mirrors this with the live Alpha reserve. The crossover/sandwich manipulation-resistance
 tests all use a *warm* EMA; the only cold-EMA test (`small_open_on_fresh_subnet_with_cold_ema`) asserts merely that a
 small open succeeds, with no bound.
 
 ### Impact
-During the warmup window an attacker can pump the live reserve in-block to inflate `T_ref`, inflating the capacity
-cap (`κ·T_ref`) and retained proceeds, and open shorts **beyond the intended risk limit** on a fresh subnet.
+During the warmup window an attacker can pump the relevant live reserve in-block to inflate `T_ref`/`A_ref`, inflating
+the capacity cap and retained proceeds, and open shorts or longs **beyond the intended risk limit** on a fresh subnet.
 
-### Proof — `poc_cold_ema_breaches_capacity_cap`
+### Proof
 ```
 honest cap = 119 TAO -> pumped cap = 399 TAO ; the over-cap open rejected at the honest reserve SUCCEEDS after pump
+long_open_cold_ema_live_alpha_bypasses_capacity_cap ... ok
 ```
 This is exactly the sandwich `sandwich_open_cannot_breach_capacity_cap` proves IMPOSSIBLE on a warm subnet.
 
@@ -122,22 +126,87 @@ floor reference) instead of falling back to the live reserve.
 
 ---
 
+## FINDING-03 — Coldkey-swap derivative aggregate orphaning (MEDIUM, pre-launch)
+
+### Root cause
+`do_swap_coldkey` treats a destination coldkey as fresh if `StakingHotkeys(new_coldkey)` is empty and the destination
+is not itself a hotkey. A coldkey can still hold a short derivative position without staking hotkeys. During rekeying,
+`swap_positions_for_coldkey_swap` drops the source short position when the destination already has a short position,
+and only decrements `ShortPositionCount`; it does not settle the dropped position or subtract it from `ShortAggregate`.
+
+### Impact
+After the swap, position storage/count report one live position while aggregate open interest/footprint still include
+the dropped position. The resulting ghost aggregate/custody state is no longer reachable through normal close/default
+paths. Direct theft was not proven; the issue is storage/accounting integrity and potential capacity/settlement griefing.
+
+### Proof
+`SKIP_WASM_BUILD=1 cargo test -p pallet-subtensor coldkey_swap -- --nocapture`
+
+The focused test `coldkey_swap_collision_orphans_short_aggregate` passes by showing `ShortAggregate.q_sigma` remains
+greater than the sum of live `ShortPositions` after a source/destination collision. The long-side mirror was tested and
+is currently blocked by `ColdKeyAlreadyAssociated` because `StakingHotkeys(new_coldkey)` remains non-empty after a long
+open.
+
+### Recommended fix
+Reject coldkey swaps when the destination already has a short derivative position on any subnet where the source also
+has a short position, or merge/settle the source position with full aggregate/custody/flow accounting.
+
+---
+
+## FINDING-04 — Short terminal settlement order dependence (MEDIUM, pre-launch)
+
+### Root cause
+`settle_shorts_on_dereg` restores each position's escrow to the live subnet reserve immediately before quoting that
+same position's spot cover cost. Because settlement iterates positions sequentially, later positions quote against a
+pool already mutated by earlier positions' escrow restoration. Identical positions can receive different terminal
+equity solely because of storage iteration order.
+
+### Impact
+Terminal payout fairness depends on coldkey/storage order rather than position economics. Splitting exposure across
+coldkeys may not be equivalent to a single equivalent exposure. This is not proven as direct pool theft; it is a
+terminal-settlement fairness/accounting bug.
+
+### Proof
+`SKIP_WASM_BUILD=1 cargo test -p pallet-subtensor terminal_settlement_pays_identical_shorts_different_equity -- --nocapture`
+
+Observed local output:
+```text
+[TERMINAL-ORDER] first equity = 332745565022 rao, second equity = 277162020499 rao
+```
+
+### Recommended fix
+Quote every terminal position against a common reserve snapshot, or restore all escrow/aggregate terminal pool state
+before any per-position quote. Add regression checks that identical positions settle equally and that split-vs-merged
+exposure is equivalent within rounding tolerance.
+
+---
+
 ## Reproduction
 
 ```bash
 # toolchain (HOME is non-persistent in this sandbox; the target/ cache under /projects persists)
 . "$HOME/.cargo/env" 2>/dev/null || curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 cd /projects/subtensor && export SKIP_WASM_BUILD=1
-# FINDING-01 (7 PoCs) + FINDING-02 (1 PoC), all in pallets/subtensor/src/tests/derivatives.rs:
+git apply security-review/tooling/poc/derivatives-poc.patch
+git apply security-review/tooling/poc/followup-derivative-modules.patch
+# FINDING-01 (intentional invariant failures proving extraction) + FINDING-02 short PoC:
 cargo test -p pallet-subtensor --lib poc_ -- --nocapture
+# FINDING-01 quote-engine control:
+cargo test -p pallet-subtensor --lib engine_cover -- --nocapture
+# FINDING-02 long mirror, FINDING-03, FINDING-04:
+cargo test -p pallet-subtensor --lib derivative_cold -- --nocapture
+cargo test -p pallet-subtensor --lib coldkey_swap -- --nocapture
+cargo test -p pallet-subtensor --lib terminal_settlement_pays_identical_shorts_different_equity -- --nocapture
 # closed-form sims + live-weights probe:
-python3 .omo/ultraresearch/20260629-120006/sim_weighted_v2_pricefixed.py
-uv run --with substrate-interface python /tmp/probe_mainnet_weights.py   # finney SwapBalancer weights
+python3 security-review/tooling/sims/sim_weighted_v2_pricefixed.py
+uv run --with substrate-interface python security-review/tooling/probes/probe_mainnet_weights.py   # finney SwapBalancer weights
 ```
-PoC tests: `poc_*` in `pallets/subtensor/src/tests/derivatives.rs`. Sims + data: `.omo/ultraresearch/20260629-120006/`.
+PoC tests: `poc_*` in `pallets/subtensor/src/tests/derivatives.rs`, plus focused modules from
+`tooling/poc/followup-derivative-modules.patch`: `derivative_cold_ema.rs`, `derivative_coldkey_swap.rs`,
+`derivative_rollback.rs`, and `derivative_terminal_settlement.rs`.
 
 ## Note for the program
-Both findings are currently non-exploitable on mainnet; we report them as **pre-launch hardening** with full,
+These findings are currently non-exploitable on mainnet; we report them as **pre-launch hardening** with full,
 transparent reachability analysis (harness PoCs proving the mechanism + live-state proof of current dormancy +
 amplifier sweep). A strict current-exploitability rubric may score them LOW/informational; a pre-launch fund-handling
-review scores them MEDIUM. We recommend fixing both before enabling shorts/longs.
+review scores them MEDIUM. We recommend fixing all confirmed issues before enabling shorts/longs.
