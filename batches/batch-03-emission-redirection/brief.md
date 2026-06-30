@@ -69,7 +69,10 @@ of holding the short vs emission TAO gained elsewhere, net of the EMA half-life 
 
 ## Verdict
 - **L2a (emission skim): LOW** — mechanism real, economically infeasible (carry 4–8× best-case benefit; κ cap bounds depression).
-- **L2b (pruning sabotage): LOW–MEDIUM** — niche: only tips an already-near-min subnet below the prune threshold (those
-  prune anyway), and immunity protects new subnets. Pre-launch.
+- **L2b (pruning sabotage): LOW–MEDIUM — SETTLED, mechanism confirmed (`finding-l2b.md`).** Harness
+  `poc_pruning_sabotage_redirect` proves the prune redirect (lowest non-immune pEMA) + immunity protection + the κ bound
+  (a 10×-min subnet is unreachable); `sim_l2b_pruning.py` shows κ=0.05 caps depression at ~9.75% ⇒ only the bottom
+  cluster (target within ~10.8% of the min) is reachable. Pure griefing (no profit) / self-protection via the long
+  mirror; carry-cost; immunity ~180d; pre-launch.
 - **D-chi-moot: informational** — the derivatives' χ/`SubnetTaoFlow` flow-neutrality machinery defends a DEAD channel
   (`get_shares_flow` is uncalled); the live emission channel is price-EMA, defended by the κ cap + slow EMA. Worth a one-line note to maintainers.

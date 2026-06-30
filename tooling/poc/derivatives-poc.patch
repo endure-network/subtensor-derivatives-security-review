@@ -1,8 +1,8 @@
 diff --git a/pallets/subtensor/src/tests/derivatives.rs b/pallets/subtensor/src/tests/derivatives.rs
-index 2a02b13..2dc1ca6 100644
+index 2a02b13..e912aa3 100644
 --- a/pallets/subtensor/src/tests/derivatives.rs
 +++ b/pallets/subtensor/src/tests/derivatives.rs
-@@ -2396,3 +2396,602 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
+@@ -2396,3 +2396,667 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
          );
      });
  }
@@ -603,5 +603,70 @@ index 2a02b13..2dc1ca6 100644
 +        let tol = -(i128::from(TAO) / 1000);
 +        assert!(d_a >= tol, "INSOLVENCY cfg A: custody short by {} rao", -d_a);
 +        assert!(d_b >= tol, "INSOLVENCY cfg B: custody short by {} rao", -d_b);
++    });
++}
++
++// ===========================================================================
++// PoC (C-L2b pruning sabotage): `get_network_to_prune` (root.rs:598) deregisters
++// the NON-IMMUNE subnet with the LOWEST `get_moving_alpha_price` (pEMA) when the
++// network is at capacity (128) and someone registers. A sustained short depresses
++// a target's spot -> pEMA, bounded to ~9.75% by the kappa=0.05 cap (see
++// sim_l2b_pruning.py), so it can REDIRECT the prune onto a chosen target ONLY if
++// that target sits within the bound of the current min. This proves the redirect
++// mechanism, that immunity protects new subnets, and that a healthy subnet (10x
++// the min) is OUT of reach of the bounded depression. The pEMA values model the
++// short's settled EMA effect; the ~9.75% magnitude is established by the sim.
++// ===========================================================================
++#[test]
++fn poc_pruning_sabotage_redirect() {
++    new_test_ext(1).execute_with(|| {
++        let a = add_dynamic_network(&U256::from(1), &U256::from(2));
++        let b = add_dynamic_network(&U256::from(3), &U256::from(4));
++        let c = add_dynamic_network(&U256::from(5), &U256::from(6));
++        let d = add_dynamic_network(&U256::from(7), &U256::from(8));
++        let targets = [a, b, c, d];
++
++        NetworkImmunityPeriod::<Test>::put(1000);
++        System::set_block_number(5000);
++
++        // Neutralize any other subnets so only A/B/C/D are prune candidates.
++        for (netuid, added) in NetworksAdded::<Test>::iter().collect::<Vec<_>>() {
++            if added && !targets.contains(&netuid) {
++                SubnetMovingPrice::<Test>::insert(netuid, I96F32::from_num(1000));
++                NetworkRegisteredAt::<Test>::insert(netuid, 0);
++            }
++        }
++
++        let set = |netuid, price: f64, reg_at: u64| {
++            SubnetMovingPrice::<Test>::insert(netuid, I96F32::from_num(price));
++            NetworkRegisteredAt::<Test>::insert(netuid, reg_at);
++        };
++        set(a, 0.0100, 0); // not immune (age 5000 > 1000)
++        set(b, 0.0105, 0); // target: ~5% above A, not immune
++        set(c, 0.0010, 4500); // LOWEST price, but immune (age 500 < 1000)
++        set(d, 0.1000, 0); // healthy, 10x the min
++
++        // Baseline: A is the victim (lowest NON-IMMUNE); C is skipped despite the lowest price.
++        let v0 = SubtensorModule::get_network_to_prune();
++        println!("[PRUNE] baseline victim={v0:?} (A={a:?}); C (min price, immune) protected");
++        assert_eq!(v0, Some(a), "prune targets the lowest NON-IMMUNE subnet");
++
++        // A short on B depresses its pEMA by <= ~9.75% (kappa=0.05). B started ~5%
++        // above A, so a within-bound depression flips it below A -> B is the victim.
++        set(b, 0.0105 * 0.9025, 0); // max ~9.75% depression
++        let v1 = SubtensorModule::get_network_to_prune();
++        println!("[PRUNE] after within-bound depression of B: victim={v1:?} (B={b:?}) -> redirect");
++        assert_eq!(v1, Some(b), "a within-kappa-bound depression redirects the prune to the target");
++
++        // Bound: a HEALTHY subnet (D, 10x the min) is unreachable — even the MAX
++        // ~9.75% depression leaves it far above the bottom cluster.
++        set(d, 0.1000 * 0.9025, 0);
++        let v2 = SubtensorModule::get_network_to_prune();
++        println!("[PRUNE] D depressed by the MAX ~9.75% is still safe: victim={v2:?} (still B)");
++        assert_eq!(
++            v2,
++            Some(b),
++            "kappa caps depression at ~9.75% -> healthy subnets are out of reach (bottom-cluster only)"
++        );
 +    });
 +}

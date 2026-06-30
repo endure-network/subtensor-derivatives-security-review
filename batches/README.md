@@ -13,7 +13,7 @@ Work only in your dir; use `../../tooling/`. Register confirmed findings in `../
 |-----|------|--------|
 | `batch-01-selfcover-weights` | F-01 self-cover / open pricing-curve asymmetry | done — MEDIUM, dormant |
 | `batch-02-cold-ema` | F-02 cold-EMA capacity bypass | done — MEDIUM; short + long confirmed; rollback probe rejected |
-| `batch-03-emission-redirection` | L2 emission redirection | settled — LOW/infeasible; pruning sabotage remains candidate |
+| `batch-03-emission-redirection` | L2 emission redirection + L2b pruning sabotage | settled — L2a LOW/infeasible; L2b LOW–MEDIUM confirmed (bounded) |
 | `batch-04-coldkey-swap` | F-03 coldkey-swap derivative aggregate orphaning | done — MEDIUM |
 | `batch-05-terminal-settlement` | F-04 short terminal settlement order dependence | done — MEDIUM |
 | `batch-06-cross-state-drain` | F-02 cross-state drain composition (escalation probe) | settled — DEFENDED (not a drain); F-02 stays MEDIUM |
