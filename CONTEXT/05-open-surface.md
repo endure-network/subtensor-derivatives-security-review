@@ -12,13 +12,18 @@ Pursue, refine, or **disprove**. These are questions, not findings. Don't assume
   `N1−K1` gap (≤ +33.5k TAO in the PoC), but the staking round-trip that manufactures the price move costs strictly
   more than the gap at every size (ratio→1.0⁺; best net −0.001 TAO). Residual (expected-defended, not separately
   reproduced): the long-side mirror and the regular `do_close_short` vehicle.
-- **Rounding/precision dust:** `mul_tao`/`mul_alpha` truncation across the ~12 legs; long partial-close chains; the
-  aggregate-Σ vs per-position `exp` decay drift (the header claims "safe direction" — verify the sign by running it).
+- **Rounding/precision dust:** `mul_tao`/`mul_alpha` truncation across the ~12 legs; long partial-close chains. The
+  aggregate-Σ vs per-position `exp` decay drift was **verified (batch-07): the sign is the SAFE direction** (custody
+  over obligations by ~7k rao even adversarially — per-position flooring across N claims exceeds the single aggregate
+  floor). Remaining: the long partial-close-chain dust on its own.
 
 ## Atomicity / state
 - **Non-transactional decay/dereg hooks:** `run_*_decay` / `settle_*_on_dereg` run in `on_initialize` (NOT rolled back);
-  transfers are guarded by `.is_ok()` while the aggregate/omega advance unconditionally — can a failed transfer desync
-  custody vs obligations? The tested slippage-failure rollback paths passed; hook-transfer failure remains the sharper lead.
+  transfers are `.is_ok()`-guarded while the aggregate/omega advance unconditionally — could a failed transfer desync
+  custody vs obligations? **SETTLED (batch-07) — no desync:** longs use can't-fail mints; short pool credits sit INSIDE
+  the `.is_ok()` guard (only the safe-direction obligation *decrease* advances unconditionally — no #2662 phantom-credit
+  path); and `custody ≥ Σ obligations` holds adversarially (`poc_decay_drift_custody_solvency`: +6,894 / +7,088 rao
+  over). Residual hardening only: the unguarded equity transfer (`let _`) and the `None`-subnet-account early return.
 - **Cold-EMA fresh-subnet window (F-02):** references fall back to live reserves before the EMA warms.
 - **Coldkey-swap derivative collisions (F-03):** short destination collisions are confirmed; watch long-side reachability
   if staking-hotkey cleanup semantics change.

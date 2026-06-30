@@ -17,3 +17,4 @@ Work only in your dir; use `../../tooling/`. Register confirmed findings in `../
 | `batch-04-coldkey-swap` | F-03 coldkey-swap derivative aggregate orphaning | done — MEDIUM |
 | `batch-05-terminal-settlement` | F-04 short terminal settlement order dependence | done — MEDIUM |
 | `batch-06-cross-state-drain` | F-02 cross-state drain composition (escalation probe) | settled — DEFENDED (not a drain); F-02 stays MEDIUM |
+| `batch-07-hook-atomicity` | Non-transactional decay/dereg hook-transfer atomicity | settled — DEFENDED (no custody desync); 2 hardening notes |

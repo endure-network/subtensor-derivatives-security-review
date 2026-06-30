@@ -184,6 +184,23 @@ exposure is equivalent within rounding tolerance.
 
 ---
 
+## Settled escalation probes (negative results)
+
+We also pursued the highest-upside escalation angles and **disproved** them with the same harness discipline — useful
+for triage, since they bound the blast radius of the confirmed findings:
+
+- **Cross-state drain (F-02 escalation, batch-06):** opening a short at an in-block-pumped reserve and cash-settling at
+  the restored reserve yields a *real* `N1−K1` gap (≤ +33.5k TAO), but the staking round-trip that manufactures the
+  price move costs strictly more than the gap at every size (`pump_loss/short_leg → 1.0` from above; best net
+  −0.001 TAO). F-02 does **not** escalate to direct theft. PoC: `poc_cold_ema_cross_state_*`.
+- **Non-transactional hook atomicity (batch-07):** the `on_initialize` decay/dereg hooks (`run_*_decay` /
+  `settle_*_on_dereg`) cannot desync custody vs obligations — longs use can't-fail mints; short pool credits are
+  `.is_ok()`-guarded (only safe-direction bookkeeping advances unconditionally); and `custody ≥ Σ obligations` holds
+  adversarially (`poc_decay_drift_custody_solvency`: +6,894 / +7,088 rao over, staggered entries + max decay). Maps to
+  and defends against recurring class #2662. Hardening: guard the one ignored equity transfer in `settle_shorts_on_dereg`.
+
+---
+
 ## Reproduction
 
 ```bash
