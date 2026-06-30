@@ -1,8 +1,8 @@
 diff --git a/pallets/subtensor/src/tests/derivatives.rs b/pallets/subtensor/src/tests/derivatives.rs
-index 2a02b13..ca58edd 100644
+index 2a02b13..2dc1ca6 100644
 --- a/pallets/subtensor/src/tests/derivatives.rs
 +++ b/pallets/subtensor/src/tests/derivatives.rs
-@@ -2396,3 +2396,529 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
+@@ -2396,3 +2396,602 @@ fn crossover_nudge_does_not_inflate_a_ref_or_capacity() {
          );
      });
  }
@@ -530,5 +530,78 @@ index 2a02b13..ca58edd 100644
 +            best_at.0,
 +            best_at.1
 +        );
++    });
++}
++
++// ===========================================================================
++// PoC (hook-transfer atomicity / decay-drift): the module docs claim "the
++// aggregate Σ-decay floors faster than the per-position exp decay, so the drift
++// is always in the safe direction (custody ≥ obligations)". The non-atomic
++// on_initialize decay restoration and dereg settlement lean on this — if custody
++// ever drifts BELOW Σ per-position claims, the guarded escrow transfer (and the
++// UNGUARDED equity transfer `let _ = transfer_tao(..)` in settle_shorts_on_dereg)
++// would silently under-pay/burn trader funds with no rollback. The existing
++// proof_multi_position_decay_conserves test uses same-entry positions + regular
++// close; this drives the drift adversarially (many STAGGERED-entry positions,
++// varied sizes, MAX decay, long horizon) and asserts the safe-direction invariant
++// directly: drift = custody − Σ(materialized floor+buffer+escrow) must be >= 0.
++// ===========================================================================
++fn drift_scenario(idx: u64, n: u64, size_mul: u64, size_mod: u64, stagger: u32, horizon: u32) -> i128 {
++    let netuid = setup_market(1_000_000 * TAO, 1_000_000 * TAO, 1.0);
++    SubtensorModule::set_short_kappa_ppb(900_000_000);
++    SubtensorModule::set_decay_bounds_ppb(1_000_000_000, 1_000_000_000); // max decay 1.0/day
++    let base = 700_000 + idx * 200_000;
++    for i in 0..n {
++        let c = U256::from(base + i);
++        let h = U256::from(base + 100_000 + i);
++        add_balance_to_coldkey_account(&c, t(10_000 * TAO));
++        let p = (1 + (i % size_mod)) * size_mul * TAO;
++        assert_ok!(SubtensorModule::open_short(
++            RuntimeOrigin::signed(c),
++            h,
++            netuid,
++            t(p),
++            None
++        ));
++        for _ in 0..stagger {
++            SubtensorModule::run_short_decay(); // stagger entry omegas
++        }
++    }
++    for _ in 0..horizon {
++        SubtensorModule::run_short_decay(); // long horizon -> buffers near dust
++    }
++
++    let mut sum_claims: u128 = 0;
++    for i in 0..n {
++        let c = U256::from(base + i);
++        if let Some(info) = SubtensorModule::get_short_position(&c, netuid) {
++            sum_claims = sum_claims
++                .saturating_add(u128::from(info.floor.to_u64()))
++                .saturating_add(u128::from(info.buffer.to_u64()))
++                .saturating_add(u128::from(info.escrow.to_u64()));
++        }
++    }
++    let custody = u128::from(custody_bal(netuid));
++    let drift = custody as i128 - sum_claims as i128;
++    println!(
++        "[DRIFT] cfg={idx} n={n} size={size_mul}x(1..{size_mod}) custody={custody} sum_claims={sum_claims} drift={drift} rao ({:.6} TAO)",
++        drift as f64 / 1e9
++    );
++    drift
++}
++
++#[test]
++fn poc_decay_drift_custody_solvency() {
++    new_test_ext(1).execute_with(|| {
++        // cfg A: 40 varied 7..77 TAO positions, staggered, max decay, 20k-block horizon.
++        let d_a = drift_scenario(0, 40, 7, 11, 37, 20_000);
++        // cfg B: 80 tiny 1..3 TAO positions (maximal per-position floor rounding).
++        let d_b = drift_scenario(1, 80, 1, 3, 11, 30_000);
++
++        // Safe-direction invariant: custody must cover Σ per-position claims in BOTH
++        // configs (a negative drift beyond dust is a settlement-insolvency finding).
++        let tol = -(i128::from(TAO) / 1000);
++        assert!(d_a >= tol, "INSOLVENCY cfg A: custody short by {} rao", -d_a);
++        assert!(d_b >= tol, "INSOLVENCY cfg B: custody short by {} rao", -d_b);
 +    });
 +}
