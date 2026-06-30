@@ -17,7 +17,9 @@ head `1a7aa37` (`feat/pool-borrowing-spec`, base `devnet-ready`, open/unmerged a
 
 All four are **real, harness-confirmed code defects** in pre-launch derivative paths. They are currently
 non-exploitable on mainnet because `ShortsEnabled`/`LongsEnabled` are default-off and the affected feature is not live,
-but they should be fixed before any production enablement.
+but they should be fixed before any production enablement. Two further **LOW / LOW–MEDIUM** cross-subnet economic
+findings (emission-redirection **L2a**, pruning-sabotage **L2b**) and three **disproved** escalation probes
+(cross-state drain, hook atomicity, slippage rollback) are documented below; the complete ledger is in `FINDINGS.md`.
 
 ## Method
 
@@ -184,6 +186,26 @@ exposure is equivalent within rounding tolerance.
 
 ---
 
+## Lower-severity confirmed findings (cross-subnet economic)
+
+Two confirmed cross-subnet economic findings sit below the four MEDIUMs — both are throttled by the `κ = 0.05`
+capacity cap and are pre-launch (shorts OFF). Detail in `batches/batch-03-emission-redirection/`.
+
+- **L2a — Emission-redirection (LOW, infeasible).** A sustained short depresses a subnet's spot → price-EMA → its
+  price-based emission share (`get_shares` → `get_shares_price_ema`), redirecting block TAO to other subnets. The
+  mechanism is real, but `sim_l2_economics.py` shows the κ cap bounds the depression to ~9.75%, and at that maximum the
+  best-case **redirected-emission / carry = 0.12–0.25** — the short's carry alone is **4–8× the benefit**, even assuming
+  100% capture and no arbitrage. Economically infeasible. *Design note (D-chi-moot):* the derivatives' χ/`SubnetTaoFlow`
+  flow-neutrality machinery defends a DEAD channel (`get_shares_flow` is uncalled); the live emission channel is price-EMA.
+- **L2b — Pruning sabotage (LOW–MEDIUM, bounded).** `get_network_to_prune` deregisters the **non-immune** subnet with
+  the lowest price-EMA at capacity (128) on registration. A sustained short can **redirect** that prune onto a chosen
+  victim — proven in `poc_pruning_sabotage_redirect` (redirect + immunity protection + the bound). But the κ cap limits
+  the depression to ~9.75% (`sim_l2b_pruning.py`), so only subnets **already within ~10.8% of the min** (the bottom
+  cluster) are reachable; a healthy subnet is out of reach. Pure griefing (no profit) / self-protection via the long
+  mirror; immunity ~180 days; pre-launch. Fix: select the prune victim on a longer-horizon / robust price, with hysteresis.
+
+---
+
 ## Settled escalation probes (negative results)
 
 We also pursued the highest-upside escalation angles and **disproved** them with the same harness discipline — useful
@@ -198,6 +220,8 @@ for triage, since they bound the blast radius of the confirmed findings:
   `.is_ok()`-guarded (only safe-direction bookkeeping advances unconditionally); and `custody ≥ Σ obligations` holds
   adversarially (`poc_decay_drift_custody_solvency`: +6,894 / +7,088 rao over, staggered entries + max decay). Maps to
   and defends against recurring class #2662. Hardening: guard the one ignored equity transfer in `settle_shorts_on_dereg`.
+- **Slippage-failure rollback (batch-02 follow-up):** the tested derivative-open slippage-failure paths roll back
+  cleanly (`slippage_failure_rolls_back_state` passes); no state desync on the extrinsic paths probed.
 
 ---
 
@@ -207,23 +231,34 @@ for triage, since they bound the blast radius of the confirmed findings:
 # toolchain (HOME is non-persistent in this sandbox; the target/ cache under /projects persists)
 . "$HOME/.cargo/env" 2>/dev/null || curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 cd /projects/subtensor && export SKIP_WASM_BUILD=1
-git apply security-review/tooling/poc/derivatives-poc.patch
-git apply security-review/tooling/poc/followup-derivative-modules.patch
-# FINDING-01 (intentional invariant failures proving extraction) + FINDING-02 short PoC:
+git apply security-review/tooling/poc/derivatives-poc.patch              # 12 poc_* in derivatives.rs
+git apply security-review/tooling/poc/followup-derivative-modules.patch  # F-02 long, F-03, F-04, rollback modules
+# All 12 poc_* — the F-01 leak proofs are INTENTIONAL failures (assertion encodes the SOUND outcome, so failure = proof);
+# F-02 cap-bypass, cross-state x2, decay-drift solvency, and pruning-sabotage all PASS:
 cargo test -p pallet-subtensor --lib poc_ -- --nocapture
 # FINDING-01 quote-engine control:
 cargo test -p pallet-subtensor --lib engine_cover -- --nocapture
-# FINDING-02 long mirror, FINDING-03, FINDING-04:
+# FINDING-02 long mirror, FINDING-03, FINDING-04, slippage-rollback probe:
 cargo test -p pallet-subtensor --lib derivative_cold -- --nocapture
 cargo test -p pallet-subtensor --lib coldkey_swap -- --nocapture
 cargo test -p pallet-subtensor --lib terminal_settlement_pays_identical_shorts_different_equity -- --nocapture
-# closed-form sims + live-weights probe:
-python3 security-review/tooling/sims/sim_weighted_v2_pricefixed.py
+cargo test -p pallet-subtensor --lib slippage_failure_rolls_back_state -- --nocapture
+# full regression — expect: 1294 passed; 6 failed; 9 ignored (the 6 failures ARE the F-01 leak proofs, by design):
+cargo test -p pallet-subtensor --lib
+# closed-form sims (offline) + live-weights probe (finney RPC):
+python3 security-review/tooling/sims/sim_weighted_v2_pricefixed.py   # F-01 weighted self-close model
+python3 security-review/tooling/sims/sim_l2_economics.py             # L2a emission redirect vs carry (0.12–0.25)
+python3 security-review/tooling/sims/sim_l2b_pruning.py              # L2b depression bound (~9.75%) + reach window + carry
 uv run --with substrate-interface python security-review/tooling/probes/probe_mainnet_weights.py   # finney SwapBalancer weights
 ```
 PoC tests: `poc_*` in `pallets/subtensor/src/tests/derivatives.rs`, plus focused modules from
 `tooling/poc/followup-derivative-modules.patch`: `derivative_cold_ema.rs`, `derivative_coldkey_swap.rs`,
 `derivative_rollback.rs`, and `derivative_terminal_settlement.rs`.
+
+**Reproducibility verified (ship gate):** both patches `git apply --check` cleanly — individually and composed — onto a
+**fresh `#2764` checkout at head `1a7aa37`**; the full pallet suite then reports **`1294 passed; 6 failed; 9 ignored`**,
+where the 6 failures are exactly the F-01 leak-proof PoCs (their assertion encodes the SOUND outcome, so the failure *is*
+the extraction proof). All five sims run offline and reproduce the documented numbers.
 
 ## Note for the program
 These findings are currently non-exploitable on mainnet; we report them as **pre-launch hardening** with full,
