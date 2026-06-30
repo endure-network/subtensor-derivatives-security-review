@@ -28,3 +28,15 @@ neutral/mitigating (`cap exp_scaled` is `dx≥0`-only; swap-size caps bound larg
 partial-fill / limit-swap moved full not slippage-safe (#1383/#1538/#1877); reserve/migration drift (#2793/#2706);
 aggregate raw-subtract wiping others' contributions (#2665); failed-transfer-but-bookkeeping-advances (#2662);
 fixed-point rounding; emission subtotal errors (#1167/#855). No public subtensor audit found ⇒ the derivatives are unaudited.
+
+## Follow-up harness facts from this review
+- The cold-EMA capacity bypass is confirmed on both short and long references. Short repro:
+  `poc_cold_ema_breaches_capacity_cap` (honest cap 119 TAO → pumped cap 399 TAO). Long repro:
+  `long_open_cold_ema_live_alpha_bypasses_capacity_cap`.
+- Slippage-failure rollback probes passed for the tested derivative open paths:
+  `derivative_rollback.rs::slippage_failure_rolls_back_state`.
+- Coldkey-swap short destination collisions can orphan aggregate state:
+  `coldkey_swap_collision_orphans_short_aggregate`. The long mirror is currently blocked by
+  `ColdKeyAlreadyAssociated`.
+- Short deregistration terminal settlement is order-dependent for identical positions:
+  `terminal_settlement_pays_identical_shorts_different_equity`.

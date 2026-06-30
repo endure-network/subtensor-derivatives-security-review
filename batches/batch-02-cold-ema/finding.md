@@ -26,15 +26,18 @@ honest cap = 119 TAO  ->  pumped cap = 399 TAO
 # the over-cap open REJECTED at the honest reserve SUCCEEDS after an in-block pump of the live reserve
 ```
 This is exactly the sandwich `sandwich_open_cannot_breach_capacity_cap` proves IMPOSSIBLE on a warm subnet.
-(The long side is symmetric; a long-side cold-EMA PoC was independently produced in the shared worktree and is
-not bundled here pending coordination.)
+
+The long side is symmetric and was confirmed with
+`derivative_cold_ema.rs::long_open_cold_ema_live_alpha_bypasses_capacity_cap`. A separate rollback/atomicity probe,
+`derivative_rollback.rs::slippage_failure_rolls_back_state`, passed for the tested slippage-failure paths, so the
+confirmed issue is the cold-reference capacity bypass rather than broad extrinsic rollback failure.
 
 ## Severity — MEDIUM (hardening)
 Re-enables a known attack class the authors explicitly defend for warm subnets, but it is **pre-launch**,
 **fresh-subnet-scoped** (only during EMA warmup, before the subnet starts emitting), and is a **risk-limit bypass,
 not a direct drain** — at the live 0.5/0.5 baseline `K0=N`, so an oversized cold-window position still returns ~`P`
-on self-close (no minting). **Open follow-up:** whether the cold window composes into a cross-state drain
-(open at a pumped reserve / close at the restored reserve) is unresolved; the proven result is the capacity bypass.
+on self-close (no minting). Whether the cold window composes into a cross-state drain (open at a pumped reserve /
+close at the restored reserve) was not proven; the confirmed result is the short/long capacity bypass.
 
 ## Fix
 Seed `SubnetAlphaInMovingReserve` (and the price EMA) at **subnet creation**, mirroring the migration's seeding for

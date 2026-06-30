@@ -12,8 +12,12 @@ The target subtensor #2764 checkout is the parent dir `/projects/subtensor`. App
 ```bash
 cd /projects/subtensor
 git apply security-review/tooling/poc/derivatives-poc.patch    # adds poc_* to tests/derivatives.rs
+git apply security-review/tooling/poc/followup-derivative-modules.patch # adds focused follow-up modules
 export SKIP_WASM_BUILD=1
 cargo test -p pallet-subtensor --lib poc_ -- --nocapture        # our PoCs
+cargo test -p pallet-subtensor --lib derivative_cold -- --nocapture
+cargo test -p pallet-subtensor --lib coldkey_swap -- --nocapture
+cargo test -p pallet-subtensor --lib terminal_settlement_pays_identical_shorts_different_equity -- --nocapture
 cargo test -p pallet-subtensor --lib derivatives -- --nocapture # the full 94-test suite
 ```
 (External clone: `git clone https://github.com/opentensor/subtensor && cd subtensor && git fetch origin pull/2764/head && git checkout FETCH_HEAD`, then apply the patch.)

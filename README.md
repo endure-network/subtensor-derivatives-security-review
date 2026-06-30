@@ -23,16 +23,17 @@ confirmed findings in a shared ledger.
 ## Layout
 - `CONTEXT/` — unbiased ground-truth: target+scope, how-it-works, substrate, build/test/tooling, verified facts, open surface.
 - `METHODOLOGY.md` — the assessment playbook + the unbiased-batch protocol + anti-patterns.
-- `tooling/` — shared tools: `poc/derivatives-poc.patch` (harness tests), `sims/` (closed-form models), `probes/` (live-mainnet).
-- `batches/` — one isolated dir per batch (`_TEMPLATE/` to start; `batch-01..` are done/in-progress).
+- `tooling/` — shared tools: PoC harness patches, `sims/` (closed-form models), `probes/` (live-mainnet).
+- `batches/` — one isolated dir per batch (`_TEMPLATE/` to start; `batch-01..` hold completed/settled work).
 - `FINDINGS.md` — the shared findings ledger (severity, status, owner).
 - `REPORT.md` — the consolidated submission report (rolls up confirmed findings).
 - `methodology/` — raw research journals from batch-01/02 (provenance; not required reading).
 
 ## Target code
 The subtensor PR #2764 checkout is the parent dir (`/projects/subtensor`). For an external clone, see
-`CONTEXT/03-build-test-tooling.md` to fetch it (`git fetch origin pull/2764/head`) and apply `tooling/poc/derivatives-poc.patch`.
+`CONTEXT/03-build-test-tooling.md` to fetch it (`git fetch origin pull/2764/head`) and apply the patches in
+`tooling/poc/`.
 
 ## Disclosure
-Findings concern a pre-launch feature and are currently non-exploitable on mainnet. **Private pending coordinated
-disclosure / bug-bounty submission.** Do not redistribute.
+Findings concern a pre-launch feature and are currently non-exploitable on mainnet. This repository is public and is
+intended as a transparent pre-launch review package for maintainers, reviewers, and bounty triage.
