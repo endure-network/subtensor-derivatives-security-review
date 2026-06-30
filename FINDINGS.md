@@ -12,6 +12,7 @@ Keep this table current; detail lives in each batch dir. Severity per `METHODOLO
 | C-rollback | Non-transactional slippage rollback/atomicity | rejected for tested paths | no issue observed | n/a | local follow-up | `slippage_failure_rolls_back_state` passed |
 | C-L2 | Emission-redirection: sustained short depresses a subnet's EMA price ⇒ cuts its price-based emission share | **LOW** (infeasible) | settled — mechanism real, uneconomical | No (shorts OFF) | batch-03 | `sim_l2_economics.py`: best-case redir/carry = 0.12–0.25 (κ cap bounds depression; carry 4–8× benefit) |
 | C-L2b | Pruning sabotage: sustained short tips a near-min subnet's EMA below the prune threshold ⇒ force its deregistration | LOW–MEDIUM (cost-framed) | candidate | No (shorts OFF) | batch-03 | `get_network_to_prune` selects lowest `get_moving_alpha_price`; prune-min ≈ 0.0033 |
+| C-xstate | Cold-EMA cross-state drain: open short at a pumped reserve / cash-settle at the restored reserve (F-02 escalation probe) | n/a — **DEFENDED** | settled — not a drain | No (shorts OFF) | batch-06 | `poc_cold_ema_cross_state_*`: gap `N1−K1` is real (≤ +33.5k TAO) but the pump round-trip cost strictly exceeds it at every size (ratio→1.0⁺); best net −0.001 TAO |
 | D-chi-moot | Design: the derivatives' χ/`SubnetTaoFlow` flow-neutrality defends a DEAD channel (`get_shares_flow` uncalled); live emission is price-EMA based | informational | confirmed | n/a | batch-03 | `get_shares` calls only `get_shares_price_ema` |
 
 ## Severity rationale notes
@@ -19,7 +20,10 @@ Keep this table current; detail lives in each batch dir. Severity per `METHODOLO
   precondition is absent on mainnet and is a *code change* away (user-LP permanently deprecated; emission proportional).
   Not LOW (impact high), not HIGH (no reachable trigger today). Escalates to HIGH if `w≠0.5` ever becomes reachable.
 - **F-02 MEDIUM:** re-enables a defended attack class on fresh subnets, but pre-launch, fresh-subnet-scoped, and a
-  *risk-limit bypass* (not a direct drain at the 0.5/0.5 baseline).
+  *risk-limit bypass* (not a direct drain at the 0.5/0.5 baseline). The cross-state drain escalation (open at a pumped
+  reserve / cash-settle at the restored reserve) was probed in **batch-06 and rejected**: the cold window genuinely
+  inflates retained proceeds and yields a real `N1−K1` gap, but the staking round-trip that manufactures the price move
+  costs strictly more than the gap at every size (ratio→1.0⁺) ⇒ F-02 does **not** escalate to HIGH.
 - **F-03 MEDIUM:** breaks derivative storage/accounting invariants and can leave ghost short aggregate/custody state;
   direct value theft was not proven, and the feature is pre-launch.
 - **F-04 MEDIUM:** terminal payout fairness/accounting issue; it can redistribute equity among derivative holders at
