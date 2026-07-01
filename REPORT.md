@@ -10,17 +10,20 @@ head `1a7aa37` (`feat/pool-borrowing-spec`, base `devnet-ready`, open/unmerged a
 
 | # | Finding | Severity | Live today? | Class |
 |---|---------|----------|-------------|-------|
+| 07 | Unbounded terminal settlement iterates all positions (≤4096/side) under a **fixed** dissolve weight ⇒ block-weight/liveness DoS | **HIGH** | No (pre-launch) | Liveness / DoS |
 | 01 | Self-cover close prices the liability on a different curve than open ⇒ pool drain under non-0.5 Balancer weights | **MEDIUM** | No (all mainnet pools at 0.5/0.5) | Latent fund-loss / conservation break |
 | 02 | Cold-EMA fresh-subnet window bypasses short and long capacity caps | **MEDIUM** | No (pre-launch) | Risk-limit bypass / hardening |
 | 03 | Coldkey-swap destination collision can orphan short derivative aggregate state | **MEDIUM** | No (pre-launch) | Lifecycle/accounting integrity |
 | 04 | Short **and long** terminal settlement can pay identical positions different equity based on storage order | **MEDIUM** | No (pre-launch) | Terminal-settlement fairness/accounting |
+| 08 | Terminal settlement uses a non-market 1:1 exact-output fallback for non-dynamic pools ⇒ possible unbacked payout | **MEDIUM** | No (pre-launch) | Value / settlement integrity |
 
-All four are **real, harness-confirmed code defects** in pre-launch derivative paths. They are currently
-non-exploitable on mainnet because `ShortsEnabled`/`LongsEnabled` are default-off and the affected feature is not live,
-but they should be fixed before any production enablement. Three further **LOW / LOW–MEDIUM** findings
-(emission-redirection **L2a**, pruning-sabotage **L2b**, and unguarded terminal equity transfer **F-06**) and three
-**disproved** escalation probes (cross-state drain, hook atomicity, slippage rollback) are documented below; the
-complete ledger is in `FINDINGS.md`.
+These are **real, harness- or code-confirmed defects** in pre-launch derivative paths, currently non-exploitable on
+mainnet because `ShortsEnabled`/`LongsEnabled` are default-off. **F-07 (HIGH, liveness/DoS) is the highest-severity
+item**; the rest are MEDIUM (01 a dormant fund-loss; 02–04 and 08 pre-launch integrity / risk-limit / value defects).
+All should be fixed before any production enablement. Five further **LOW / LOW–MEDIUM** findings (emission-redirection
+**L2a**, pruning-sabotage **L2b**, unguarded terminal equity transfer **F-06**, long realization asymmetry **F-09**, and
+the fee-less `limit_price` guard **F-10**) and three **disproved** escalation probes (cross-state drain, hook atomicity,
+slippage rollback) are documented below; the complete ledger is in `FINDINGS.md`.
 
 **Independent verification round (2026-07-01).** Findings 01–04 and both LOW economic findings were re-checked by a
 parallel round of independent audit agents — two blind first-pass auditors (working from the unbiased `CONTEXT/` only)
@@ -236,10 +239,74 @@ that identical positions settle equally and that split-vs-merged exposure is equ
 
 ---
 
+## FINDING-07 — Unbounded terminal settlement under a fixed dissolve weight (HIGH, pre-launch)
+
+*Surfaced by the independent code review (2026-07-01) and re-verified against the source here.*
+
+### Root cause
+`settle_shorts_on_dereg` ([mod.rs L738-788]) and `settle_longs_on_dereg` ([long.rs L494-535]) each do
+`iter_prefix(netuid).collect()` and loop over **every** position on the subnet (materialize + up to two `transfer_tao`
++ `recycle_custody_tao` per position), while the `dissolve_network` dispatch carries a **fixed** weight
+(`Weight::from_parts(119M) + reads(6) + writes(31)`, [dispatches.rs L1234-1236]) that does **not** scale with the
+position count. The per-side caps clamp to `[1,4096]` ([mod.rs L892], [long.rs L555]) ⇒ up to ~8192 position
+settlements can run in a single dissolution block under that fixed weight.
+
+### Impact
+A heavily-populated subnet can make dissolution exceed the block's real weight budget — a **liveness / DoS** on
+consensus-critical chain maintenance (block production stalling on subnet teardown). The work is invisible to the
+dispatch weight, so it is not throttled by the normal block-fullness mechanism.
+
+### Reachability (composes with F-05)
+Dissolution is not owner-only. Via **F-05**, any registration at `SubnetLimit` forces the lowest-price-EMA non-immune
+subnet through `settle_*_on_dereg`. An attacker can pre-stuff a target subnet with up-to-4096/side min-input positions
+(min-input floor + per-position fees bound the cost) and then trigger — or wait for — its dissolution, whether by a
+governance dereg or by biasing the prune target (**L2b**). Pre-launch (shorts/longs OFF).
+
+### Severity rationale: HIGH
+Liveness/DoS on chain maintenance is the highest-impact class in this report — qualitatively above the dormant-economic
+MEDIUMs. **Partial mitigation already present:** the authors deliberately clamp the caps to `[1,4096]`/side (their own
+comment: "so governance can't lift the dereg-settlement" cost). **Residual:** the loop is still unbounded up to that cap
+and the dispatch weight is fixed, so ~8192 settlements can outrun a `reads(6)/writes(31)` budget; the PR body itself
+lists incremental settlement as a required follow-up. Not exploitable today (pre-launch).
+
+### Recommended fix
+Paginate / incrementally settle terminal positions across blocks (cursor), or benchmark `dissolve_network` with a weight
+that scales with the live position count, and keep production caps within a proven block-weight bound.
+
+---
+
+## FINDING-08 — 1:1 exact-output fallback for non-dynamic pools in terminal settlement (MEDIUM, pre-launch)
+
+*Surfaced by the independent code review (2026-07-01) and re-verified against the source here.*
+
+### Root cause
+The exact-output swap sims `sim_tao_in_for_alpha_out` / `sim_alpha_in_for_tao_out` branch on `SubnetInfo::mechanism`:
+for a dynamic subnet (`mechanism == 1`) they route through the real Balancer engine, but the fallthrough branch
+(`mechanism ≠ 1`) returns a **non-market 1:1** quote — `Ok(alpha_out.to_u64().into())` / `Ok(tao_out.to_u64().into())`
+([impls.rs L412-418, L440-446]). `settle_shorts_on_dereg` / `settle_longs_on_dereg` price terminal cover through those
+sims **without** re-asserting `SubnetMechanism == 1`.
+
+### Impact
+A derivative position that survives a dynamic→legacy mechanism transition has its terminal cover/equity valued off the
+1:1 fallback rather than the market curve — a potential **unbacked payout** (or mis-seizure) at settlement, decoupled
+from the pool's real reserves.
+
+### Severity rationale: MEDIUM
+A real value-integrity defect on a settlement path, but confidence is medium: it requires a position to persist across a
+mechanism transition, whose reachability with live derivative positions needs further analysis. Pre-launch.
+
+### Recommended fix
+Define explicit settlement behavior for non-dynamic pools (reject, or value against the legacy mechanism's own pricing);
+do not silently value derivative liabilities at 1:1. Assert `SubnetMechanism == 1` in `settle_*_on_dereg`, or handle the
+transition case.
+
+---
+
 ## Lower-severity confirmed findings
 
-Below the four MEDIUMs sit two cross-subnet economic findings (both throttled by the `κ = 0.05` capacity cap; detail in
-`batches/batch-03-emission-redirection/`) and one fund-handling code defect (**F-06**). All are pre-launch (shorts OFF).
+Below the MEDIUMs sit two cross-subnet economic findings (both throttled by the `κ = 0.05` capacity cap; detail in
+`batches/batch-03-emission-redirection/`) and three fund-handling / settlement code defects (**F-06**, **F-09**,
+**F-10**). All are pre-launch (shorts OFF).
 
 - **L2a — Emission-redirection (LOW, infeasible).** A sustained short depresses a subnet's spot → price-EMA → its
   price-based emission share (`get_shares` → `get_shares_price_ema`), redirecting block TAO to other subnets. The
@@ -264,6 +331,20 @@ Below the four MEDIUMs sit two cross-subnet economic findings (both throttled by
   burn itself is narrow — ED-edge, dereg-gated, pre-launch, no third-party profit); the independent code review (which
   rates it HIGH, 3 reviewers incl. security) adds the event-integrity dimension, so we raise it to **LOW→MEDIUM**. Fix:
   cap equity to transferable custody / hold unpaid equity in a refundable ledger, and emit only the amount transferred.
+- **F-09 — Long terminal equity is realized asymmetrically as Alpha stake (LOW–MEDIUM, pre-launch).**
+  `settle_longs_on_dereg` credits long terminal equity as **minted Alpha stake** (`increase_stake_for_hotkey_and_coldkey_on_subnet`
+  + `SubnetAlphaOut`, [long.rs L519-523]), then `destroy_alpha_in_out_stakes` distributes the subnet pot pro-rata —
+  whereas shorts pay **TAO** directly from custody ([mod.rs L769-770]). The asymmetry can dilute / under-realize the
+  computed equity once the pot is distributed, and no test asserts the final TAO-equivalent through destruction. (Because
+  longs *mint* stake — a can't-fail credit — the F-06 burn does **not** apply to the long side; the long-side risk is
+  dilution, not silent loss.) Fix: document the asymmetric terminal semantics, or settle long equity through a
+  TAO-equivalent-preserving mechanism.
+- **F-10 — `limit_price` binds the fee-less raw spot, not the realized price (LOW, pre-launch).**
+  `ensure_price_at_least/at_most` use `executable_price_ppb` — a fee-less raw `SubnetTAO/SubnetAlphaIn` ratio
+  ([mod.rs L804-811]) — while the close-cost quotes route through the fee- and weight-aware engine (`SimSwapOpts::WITH_FEES`).
+  So `limit_price` can pass while the fee/weight-aware realized price is outside the intended bound: weaker MEV/sandwich
+  protection than the parameter implies, **even at 0.5/0.5** (the fee gap alone). Fix: enforce `limit_price` against the
+  engine quote / post-trade effective price. Couples to F-01's fix.
 
 ---
 
@@ -325,8 +406,8 @@ measure" discipline this review holds itself to.
 
 **Observation (now promoted to F-10).** `executable_price_ppb` uses the naive fee-less `T/A` spot price rather than the
 fee+weight-aware realized cost ([mod.rs L802-811]); this weakens `limit_price` protection more broadly than first
-thought — the fee gap bites even at 0.5/0.5. The independent code review promoted this to a MEDIUM correctness finding;
-we carry it as **F-10** in the cross-reference section below.
+thought — the fee gap bites even at 0.5/0.5. The independent code review promoted this to a correctness finding; we
+carry it as **F-10** among the lower-severity findings above.
 
 **Process note.** The four agents shared one target checkout, so their PoC test files collided in the shared tree; each
 agent's work was preserved separately and the substantive findings are unaffected, but future parallel rounds should
@@ -353,39 +434,11 @@ structural/correctness defects, not economic PoCs). The review is archived in
 - **`executable_price_ppb`** and **D-chi-moot** — both corroborated (promoted / refined below).
 
 ### New in-scope findings adopted (code-verified)
-
-**F-07 — Unbounded terminal settlement under a fixed dissolve weight (HIGH, pre-launch).**
-`settle_shorts_on_dereg` / `settle_longs_on_dereg` do `iter_prefix(netuid).collect()` and loop over **every** position
-(materialize + up to two `transfer_tao` + recycle each), while the `dissolve_network` dispatch carries a **fixed** weight
-(`reads(6)/writes(31)`, [dispatches.rs L1234-1236]) that does not scale with position count. Per-side caps clamp to
-`[1,4096]` ([mod.rs L892], [long.rs L555]) ⇒ up to ~8192 settlements in one dissolution block. A heavily-populated subnet
-can push dissolution past the block's real budget — a **liveness/DoS** on consensus-critical chain maintenance — and it
-composes with **F-05**: an attacker pre-stuffs a subnet with min-input positions, then forces it through the prune path.
-The authors deliberately capped at 4096/side ("so governance can't lift the dereg-settlement" cost) — a partial
-mitigation — but the fixed weight + unbounded loop remain a weight-accounting gap the PR body itself flags for
-incremental settlement. **This is the highest-severity item in the report** (liveness, not dormant-economic), though
-still pre-launch. Fix: paginated/incremental settlement, or benchmarked weight that scales with live position count.
-
-**F-08 — 1:1 exact-output fallback for non-dynamic pools in settlement (MEDIUM, pre-launch).**
-`sim_tao_in_for_alpha_out` / `sim_alpha_in_for_tao_out` return a non-market **1:1** cost for `mechanism ≠ 1`
-([impls.rs L412-418, L440-446]), and `settle_*_on_dereg` never re-assert the subnet is still dynamic. A position that
-survives a dynamic→legacy mechanism transition would have its terminal cover/equity valued off 1:1 — a potential unbacked
-payout. Fix: define settlement for non-dynamic pools; don't silently value derivative liabilities at 1:1.
-
-**F-09 — Long terminal equity realized asymmetrically as Alpha stake (LOW–MEDIUM, pre-launch).**
-`settle_longs_on_dereg` credits long terminal equity as **minted Alpha stake** (`increase_stake_for_hotkey_and_coldkey_on_subnet`
-+ `SubnetAlphaOut`, [long.rs L519-523]), then `destroy_alpha_in_out_stakes` distributes the pot pro-rata — whereas shorts
-pay **TAO** directly from custody. The asymmetry can dilute/under-realize the computed equity once the pot is distributed;
-no test asserts the final TAO-equivalent through destruction. (Because longs *mint* stake — a can't-fail credit — the
-F-06 burn does **not** apply to the long side; the long-side risk is dilution, not silent loss.) Fix: document the
-asymmetric terminal semantics, or settle long equity through a TAO-equivalent-preserving mechanism.
-
-**F-10 — `limit_price` binds the fee-less raw spot, not the realized price (LOW, pre-launch).**
-`ensure_price_at_least/at_most` use `executable_price_ppb` — a fee-less raw `SubnetTAO/SubnetAlphaIn` ratio
-([mod.rs L804-811]) — while close-cost quotes route through the fee- and weight-aware engine (`SimSwapOpts::WITH_FEES`).
-So `limit_price` can pass while the fee/weight-aware realized price is outside the intended bound: weaker MEV/sandwich
-protection than the parameter implies, **even at 0.5/0.5** (the fee gap alone). Fix: enforce `limit_price` against the
-engine quote / post-trade effective price. Couples to F-01's fix.
+Four in-scope defects the review surfaced were **re-verified against the source and promoted into this report's finding
+structure**: **F-07** (HIGH) and **F-08** (MEDIUM) as first-class findings above (see FINDING-07 / FINDING-08), and
+**F-09** (LOW–MEDIUM) and **F-10** (LOW) among the lower-severity findings above. All four are code-verified with their
+source anchors in those sections and carried in the ledger (`FINDINGS.md`); the reconciliations below are the residual
+overlap that stays a cross-reference.
 
 ### Reconciliations (our DEFENDED verdicts stand; hardening framing adopted)
 - **C-rollback (review HIGH "late checks after mutations"):** our `slippage_failure_rolls_back_state` test confirms the
