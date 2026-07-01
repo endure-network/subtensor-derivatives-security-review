@@ -13,13 +13,29 @@ head `1a7aa37` (`feat/pool-borrowing-spec`, base `devnet-ready`, open/unmerged a
 | 01 | Self-cover close prices the liability on a different curve than open ⇒ pool drain under non-0.5 Balancer weights | **MEDIUM** | No (all mainnet pools at 0.5/0.5) | Latent fund-loss / conservation break |
 | 02 | Cold-EMA fresh-subnet window bypasses short and long capacity caps | **MEDIUM** | No (pre-launch) | Risk-limit bypass / hardening |
 | 03 | Coldkey-swap destination collision can orphan short derivative aggregate state | **MEDIUM** | No (pre-launch) | Lifecycle/accounting integrity |
-| 04 | Short terminal settlement can pay identical positions different equity based on storage order | **MEDIUM** | No (pre-launch) | Terminal-settlement fairness/accounting |
+| 04 | Short **and long** terminal settlement can pay identical positions different equity based on storage order | **MEDIUM** | No (pre-launch) | Terminal-settlement fairness/accounting |
 
 All four are **real, harness-confirmed code defects** in pre-launch derivative paths. They are currently
 non-exploitable on mainnet because `ShortsEnabled`/`LongsEnabled` are default-off and the affected feature is not live,
-but they should be fixed before any production enablement. Two further **LOW / LOW–MEDIUM** cross-subnet economic
-findings (emission-redirection **L2a**, pruning-sabotage **L2b**) and three **disproved** escalation probes
-(cross-state drain, hook atomicity, slippage rollback) are documented below; the complete ledger is in `FINDINGS.md`.
+but they should be fixed before any production enablement. Three further **LOW / LOW–MEDIUM** findings
+(emission-redirection **L2a**, pruning-sabotage **L2b**, and unguarded terminal equity transfer **F-06**) and three
+**disproved** escalation probes (cross-state drain, hook atomicity, slippage rollback) are documented below; the
+complete ledger is in `FINDINGS.md`.
+
+**Independent verification round (2026-07-01).** Findings 01–04 and both LOW economic findings were re-checked by a
+parallel round of independent audit agents — two blind first-pass auditors (working from the unbiased `CONTEXT/` only)
+and two adversarial verifiers — each reproducing in the real harness. Result: **all findings upheld, none overturned,
+no false positives**; the three disproved probes were independently re-confirmed **defended** (including the long-mirror,
+regular in-kind, and amortized-pump cross-state regimes this report had earlier left un-reproduced); and one scope
+correction is adopted here — **F-04 is not short-only: the long terminal-settlement mirror is confirmed with the same
+root cause (F-04b, below).** The round also surfaced one new LOW code defect (F-06). Full detail, per-agent, in
+`batches/batch-08-verification/`.
+
+> **Severity basis (unchanged, made explicit).** We hold all four confirmed findings at **MEDIUM** on a *pre-launch
+> fund-handling* rubric (active fund-handling machinery; fix-before-enable). A strict *current-exploitability*
+> bug-bounty rubric would score most of them **LOW/informational** (dormant, pre-launch, no proven theft today). Both
+> independent verifiers concurred the MEDIUMs are defensible but lean toward the generous end; we **keep MEDIUM and
+> disclose the tension** rather than split the rating per finding.
 
 ## Method
 
@@ -158,38 +174,58 @@ has a short position, or merge/settle the source position with full aggregate/cu
 
 ---
 
-## FINDING-04 — Short terminal settlement order dependence (MEDIUM, pre-launch)
+## FINDING-04 — Terminal settlement order dependence, short AND long (MEDIUM, pre-launch)
 
 ### Root cause
-`settle_shorts_on_dereg` restores each position's escrow to the live subnet reserve immediately before quoting that
-same position's spot cover cost. Because settlement iterates positions sequentially, later positions quote against a
-pool already mutated by earlier positions' escrow restoration. Identical positions can receive different terminal
-equity solely because of storage iteration order.
+`settle_shorts_on_dereg` ([mod.rs L738-788]) restores each position's escrow to the live subnet reserve immediately
+before quoting that same position's spot cover cost. Because settlement iterates positions sequentially
+(`ShortPositions::iter_prefix`), later positions quote against a pool already mutated by earlier positions' escrow
+restoration. Identical positions can receive different terminal equity solely because of storage iteration order.
+**The long mirror is identical (F-04b):** `settle_longs_on_dereg` ([long.rs L494-535]) restores each position's Alpha
+escrow into the live reserve before quoting its own `long_spot_close_cost`, so identical longs also settle to different
+equity.
 
 ### Impact
 Terminal payout fairness depends on coldkey/storage order rather than position economics. Splitting exposure across
-coldkeys may not be equivalent to a single equivalent exposure. This is not proven as direct pool theft; it is a
-terminal-settlement fairness/accounting bug.
+coldkeys may not be equivalent to a single equivalent exposure. Value is **conserved** (over-charged cover is
+recycled/burned, escrow rejoins the pool, equity is paid to the trader), so this is a terminal-settlement
+fairness/accounting + non-determinism bug on **both** sides — not proven as direct pool theft.
 
-### Proof
-`SKIP_WASM_BUILD=1 cargo test -p pallet-subtensor terminal_settlement_pays_identical_shorts_different_equity -- --nocapture`
+### Reachability (F-05 — force-reachable via subnet prune)
+Terminal settlement is **not** limited to a subnet owner voluntarily dissolving. When the network is at `SubnetLimit`
+(128), `do_register_network` calls `get_network_to_prune` → `do_dissolve_network`, which runs `settle_shorts_on_dereg`
+/ `settle_longs_on_dereg` **before** `destroy_alpha_in_out_stakes`. So **any** party who registers a subnet at capacity
+forces the lowest-price-EMA non-immune subnet through terminal settlement — the same prune target an attacker can bias
+via the **L2b** pruning-sabotage lever. This converts F-04 from "owner-only" into "permissionless-ish under capacity";
+it adds no drain on its own, but it is why fixing F-04's order-dependence matters.
 
-Observed local output:
-```text
-[TERMINAL-ORDER] first equity = 332745565022 rao, second equity = 277162020499 rao
+### Proof — short and long, independently reproduced (2026-07-01)
+```bash
+# short (followup patch, batch-05):
+cargo test -p pallet-subtensor --lib terminal_settlement_pays_identical_shorts_different_equity -- --nocapture
+# long mirror F-04b (verification-round patch — poc_long_terminal_settlement_order_dependent):
+cargo test -p pallet-subtensor --lib poc_long_terminal_settlement_order_dependent -- --nocapture
 ```
+```text
+[TERMINAL-ORDER]  first equity = 332745565022 rao, second equity = 277162020499 rao          # short
+[F-04 long NEW]   identical longs -> equity(alpha) c1=49974809931 c2=41637278252 |diff|=8337531679 (8.3375 alpha-TAO)   # long F-04b
+```
+A second, independent long-mirror implementation (verify-gpt's `terminal_settlement_pays_identical_longs_different_equity`,
+first = 277.16 / second = 332.75 rao) is archived in `batches/batch-08-verification/agent-outputs/`. F-04b was
+previously flagged only "investigate"; two independent agents each wrote a PoC and both confirm the long mirror with
+the same root cause and magnitude as the short side.
 
 ### Recommended fix
 Quote every terminal position against a common reserve snapshot, or restore all escrow/aggregate terminal pool state
-before any per-position quote. Add regression checks that identical positions settle equally and that split-vs-merged
-exposure is equivalent within rounding tolerance.
+before any per-position quote — on **both** `settle_shorts_on_dereg` and `settle_longs_on_dereg`. Add regression checks
+that identical positions settle equally and that split-vs-merged exposure is equivalent within rounding tolerance.
 
 ---
 
-## Lower-severity confirmed findings (cross-subnet economic)
+## Lower-severity confirmed findings
 
-Two confirmed cross-subnet economic findings sit below the four MEDIUMs — both are throttled by the `κ = 0.05`
-capacity cap and are pre-launch (shorts OFF). Detail in `batches/batch-03-emission-redirection/`.
+Below the four MEDIUMs sit two cross-subnet economic findings (both throttled by the `κ = 0.05` capacity cap; detail in
+`batches/batch-03-emission-redirection/`) and one fund-handling code defect (**F-06**). All are pre-launch (shorts OFF).
 
 - **L2a — Emission-redirection (LOW, infeasible).** A sustained short depresses a subnet's spot → price-EMA → its
   price-based emission share (`get_shares` → `get_shares_price_ema`), redirecting block TAO to other subnets. The
@@ -203,6 +239,16 @@ capacity cap and are pre-launch (shorts OFF). Detail in `batches/batch-03-emissi
   the depression to ~9.75% (`sim_l2b_pruning.py`), so only subnets **already within ~10.8% of the min** (the bottom
   cluster) are reachable; a healthy subnet is out of reach. Pure griefing (no profit) / self-protection via the long
   mirror; immunity ~180 days; pre-launch. Fix: select the prune victim on a longer-horizon / robust price, with hysteresis.
+- **F-06 — Unguarded terminal equity transfer can silently burn a trader's payout (LOW, pre-launch).** In
+  `settle_shorts_on_dereg` the equity payout is fire-and-forget — `let _ = Self::transfer_tao(&custody, &coldkey,
+  equity.into())` ([mod.rs L769-772]) with no `.is_ok()` check (unlike the escrow-restore credit at [mod.rs L754-759],
+  which *is* guarded) — and any custody remainder is then swept to issuance by `recycle_custody_tao(&custody,
+  TaoBalance::MAX)` ([mod.rs L784]). If the transfer fails (destination coldkey left below the existential deposit, or
+  dust-empty), the equity is **not paid and is then burned** by the sweep — a silent loss of funds the trader was owed.
+  Reachability is narrow (a trader normally holds a funded coldkey — they posted `P` from it — so the transfer fails
+  only in an ED-edge state; dereg-gated; pre-launch), which is why both adversarial verifiers noted the code path but
+  declined to promote it above LOW. Fix: settle equity with an existence/ED-safe transfer, or on failure hold the
+  amount in a claimable ledger rather than letting the terminal sweep burn it.
 
 ---
 
@@ -211,17 +257,65 @@ capacity cap and are pre-launch (shorts OFF). Detail in `batches/batch-03-emissi
 We also pursued the highest-upside escalation angles and **disproved** them with the same harness discipline — useful
 for triage, since they bound the blast radius of the confirmed findings:
 
-- **Cross-state drain (F-02 escalation, batch-06):** opening a short at an in-block-pumped reserve and cash-settling at
-  the restored reserve yields a *real* `N1−K1` gap (≤ +33.5k TAO), but the staking round-trip that manufactures the
-  price move costs strictly more than the gap at every size (`pump_loss/short_leg → 1.0` from above; best net
-  −0.001 TAO). F-02 does **not** escalate to direct theft. PoC: `poc_cold_ema_cross_state_*`.
+- **Cross-state drain (F-02 escalation, batch-06 + verification round):** opening a short at an in-block-pumped reserve
+  and cash-settling at the restored reserve yields a *real* `N1−K1` gap (≤ +33.5k TAO), but the staking round-trip that
+  manufactures the price move costs strictly more than the gap at every size (`pump_loss/short_leg → 1.0` from above;
+  best net −0.001 TAO). F-02 does **not** escalate to direct theft. The verification round additionally **attacked**
+  three regimes this report had left un-reproduced — all **defended** (reproduced 2026-07-01, `derivative_break_opus.rs`):
+  amortizing one pump across `m∈{1,4,16}` self-closes (best net **−0.826 TAO**, more negative as `m` grows), the regular
+  in-kind `close_short` vehicle (best net **−0.0025 TAO**), and the long-mirror cold-`A_ref` cross-state (best net
+  **+3012 rao ≈ 0**, dust both signs). PoC: `poc_cold_ema_cross_state_*`, `break_amortized_pump_short_self_close`,
+  `break_regular_close_short_cross_state`, `break_long_mirror_cross_state`.
 - **Non-transactional hook atomicity (batch-07):** the `on_initialize` decay/dereg hooks (`run_*_decay` /
   `settle_*_on_dereg`) cannot desync custody vs obligations — longs use can't-fail mints; short pool credits are
   `.is_ok()`-guarded (only safe-direction bookkeeping advances unconditionally); and `custody ≥ Σ obligations` holds
   adversarially (`poc_decay_drift_custody_solvency`: +6,894 / +7,088 rao over, staggered entries + max decay). Maps to
-  and defends against recurring class #2662. Hardening: guard the one ignored equity transfer in `settle_shorts_on_dereg`.
+  and defends against recurring class #2662. Hardening: guard the one ignored equity transfer in `settle_shorts_on_dereg`
+  (now tracked as **F-06** above).
 - **Slippage-failure rollback (batch-02 follow-up):** the tested derivative-open slippage-failure paths roll back
   cleanly (`slippage_failure_rolls_back_state` passes); no state desync on the extrinsic paths probed.
+
+---
+
+## Independent verification round (2026-07-01)
+
+To stress-test this report before submission, four independent audit agents were run in parallel against the same
+target, each reproducing in the real harness: **two blind first-pass auditors** (given only the unbiased `CONTEXT/`,
+withheld from `FINDINGS.md`/`REPORT.md`) and **two adversarial verifiers** (tasked to overturn every claim). Raw
+deliverables are archived under `batches/batch-08-verification/`.
+
+| Agent | Role | Verdict | Contribution |
+|-------|------|---------|--------------|
+| verifier A | adversarial re-check | **all 6 findings + 3 probes UPHELD; 0 overturned; 0 false positives** | strengthened F-01 dormancy; independently broke the 3 un-reproduced cross-state regimes |
+| verifier B | adversarial re-check | **all 6 findings + 3 probes UPHELD; found F-04 scope understated** | contributed the F-04b long-mirror PoC; flagged `executable_price_ppb` naive pricing |
+| auditor A | blind first pass | broke none of the priced economics | independently re-derived F-02 + F-04; found F-04b and F-06; disproved 5 drain hypotheses |
+| auditor B | blind first pass | did not deliver (context exhaustion) | — (run archived for completeness) |
+
+**Outcome.** Every confirmed finding and every "defended" verdict was independently reproduced; nothing was overturned;
+no false positive was found. Two substantive results were folded into this report: **F-04b** (long terminal-settlement
+mirror, promoted "investigate" → confirmed) and **F-06** (unguarded terminal equity transfer, new LOW). The three
+disproved cross-state probes were positively re-defended (see the escalation-probes section).
+
+**F-01 dormancy — strengthened.** A verifier added an emission-stability test (`stability_realistic_emission_keeps_weight_pinned`)
+showing that *proportional* protocol emission is an exact fixed point at `w=0.5` (drift `0.00e0` over 200 injections)
+and that a seeded migration-style skew **self-heals** toward 0.5 (0.4500 → 0.4571 over 400 injections). This confirms
+at the code level — not only via the finney snapshot — that `w≠0.5` is a code change away and self-correcting; F-01's
+dormancy is robust, if anything *more* dormant than the live probe alone shows.
+
+**Honesty note (recorded).** Two independent agents' first long-mirror cross-state harness printed a spurious
+"+80,000 TAO drain" that was a P&L-measurement bug (initial balance captured *after* the manipulation stake, so the
+recovered principal counted as profit); after fixing the measurement (init before the pump) the long mirror nets ~0.
+Two separate harnesses hitting and self-correcting the same artifact is the exact "don't claim a leak you didn't truly
+measure" discipline this review holds itself to.
+
+**Un-promoted observation.** `executable_price_ppb` uses the naive `T/A` spot price rather than the Balancer-weighted
+price ([mod.rs L802-811]); this is inert while weights are 0.5/0.5 but would make caller slippage bounds weight-unaware
+if F-01's precondition were ever armed — another reason F-01's fix should make the whole open/close/limit-price model
+weight-consistent, not merely clamp self-close.
+
+**Process note.** The four agents shared one target checkout, so their PoC test files collided in the shared tree; each
+agent's work was preserved separately and the substantive findings are unaffected, but future parallel rounds should
+give each agent an isolated checkout (captured in `METHODOLOGY.md`).
 
 ---
 
@@ -243,6 +337,8 @@ cargo test -p pallet-subtensor --lib derivative_cold -- --nocapture
 cargo test -p pallet-subtensor --lib coldkey_swap -- --nocapture
 cargo test -p pallet-subtensor --lib terminal_settlement_pays_identical_shorts_different_equity -- --nocapture
 cargo test -p pallet-subtensor --lib slippage_failure_rolls_back_state -- --nocapture
+# Verification round (2026-07-01) — apply tooling/poc/verification-round.patch first:
+cargo test -p pallet-subtensor --lib tests::derivative_break_opus -- --nocapture  # F-04b long mirror + 3 cross-state breaks DEFENDED + F-01 STAB + F-02/F-04 reproductions (7 pass)
 # full regression — expect: 1294 passed; 6 failed; 9 ignored (the 6 failures ARE the F-01 leak proofs, by design):
 cargo test -p pallet-subtensor --lib
 # closed-form sims (offline) + live-weights probe (finney RPC):
@@ -253,7 +349,8 @@ uv run --with substrate-interface python security-review/tooling/probes/probe_ma
 ```
 PoC tests: `poc_*` in `pallets/subtensor/src/tests/derivatives.rs`, plus focused modules from
 `tooling/poc/followup-derivative-modules.patch`: `derivative_cold_ema.rs`, `derivative_coldkey_swap.rs`,
-`derivative_rollback.rs`, and `derivative_terminal_settlement.rs`.
+`derivative_rollback.rs`, and `derivative_terminal_settlement.rs` (the last now also carries the F-04b long-mirror
+test); the verification round adds `derivative_break_opus.rs` via `tooling/poc/verification-round.patch`.
 
 **Reproducibility verified (ship gate):** both patches `git apply --check` cleanly — individually and composed — onto a
 **fresh `#2764` checkout at head `1a7aa37`**; the full pallet suite then reports **`1294 passed; 6 failed; 9 ignored`**,

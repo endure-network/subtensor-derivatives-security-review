@@ -21,6 +21,16 @@ The value of parallel batches is *independent* coverage, so avoid anchoring:
 - `CONTEXT/05-open-surface.md` gives *leads* (questions), not answers.
 - Re-verify any shared "fact" that is load-bearing for your finding — the verified-facts doc includes repro steps for this.
 
+## Parallel execution — isolate the target checkout (learned in batch-08)
+Running multiple agents at once buys throughput, but they must **not** share the target working tree. In the batch-08
+verification round all four agents compiled against the same `/projects/subtensor`, so their PoC test files collided:
+two agents independently created `derivative_break_opus.rs` (the on-disk file became whichever wrote last), and one
+agent's report leaked into the target repo root. The findings survived (each agent kept a private copy and results
+converged), but a `cargo test` run could silently compile another agent's tests. **Rule:** give each parallel agent its
+own checkout (`git worktree add` per agent), or at minimum a unique PoC-filename namespace per agent, and treat the
+shared target tree as read-only scaffolding. The deliverable repo (`security-review/`) is safely worktree-isolated; the
+gap is the Rust target tree it points at.
+
 ## Anti-patterns (learned on this target)
 - **Precondition smuggling:** claiming an exploit from a PoC that *set up* the precondition with a test helper, without
   checking it is reachable in production. (F-01 looked CRITICAL until the live-weights probe showed all pools at 0.5/0.5.)
