@@ -31,6 +31,16 @@ correction is adopted here — **F-04 is not short-only: the long terminal-settl
 root cause (F-04b, below).** The round also surfaced one new LOW code defect (F-06). Full detail, per-agent, in
 `batches/batch-08-verification/`.
 
+**External code review (2026-07-01).** A separate full-PR code review (10 first-pass reviewers across four provider
+families + security/tests/maintainability/database specialists, evidence-adjudicated) was then run over the entire
+#2764 diff. It **independently corroborated** findings 02, 03 (which it rates HIGH), 06 (HIGH), `executable_price_ppb`,
+and our χ/flow-dead conclusion, and surfaced four additional **in-scope** defects — all re-verified against the source
+here and folded in: **F-07** — unbounded terminal-settlement iteration under a *fixed* dissolve weight (**HIGH**,
+liveness/DoS — the **highest-severity item in this report**); **F-08** — 1:1 exact-output fallback for non-dynamic pools
+in settlement (MEDIUM); **F-09** — long terminal equity realized asymmetrically as Alpha stake (LOW–MEDIUM); **F-10** —
+`limit_price` binds the fee-less raw spot, not the realized price (LOW). F-06 is correspondingly raised to **LOW→MEDIUM**.
+See "Cross-reference: independent full code review" below.
+
 > **Severity basis (unchanged, made explicit).** We hold all four confirmed findings at **MEDIUM** on a *pre-launch
 > fund-handling* rubric (active fund-handling machinery; fix-before-enable). A strict *current-exploitability*
 > bug-bounty rubric would score most of them **LOW/informational** (dormant, pre-launch, no proven theft today). Both
@@ -168,6 +178,10 @@ greater than the sum of live `ShortPositions` after a source/destination collisi
 is currently blocked by `ColdKeyAlreadyAssociated` because `StakingHotkeys(new_coldkey)` remains non-empty after a long
 open.
 
+> The independent code review (2026-07-01) corroborates this finding and rates it **HIGH**, adding that
+> `cleanup_short_if_empty` can then remove the aggregate/active-set based on the decremented count while a destination
+> position still exists — so per-block decay restoration and settlement subsequently operate on phantom/missing state.
+
 ### Recommended fix
 Reject coldkey swaps when the destination already has a short derivative position on any subnet where the source also
 has a short position, or merge/settle the source position with full aggregate/custody/flow accounting.
@@ -239,16 +253,17 @@ Below the four MEDIUMs sit two cross-subnet economic findings (both throttled by
   the depression to ~9.75% (`sim_l2b_pruning.py`), so only subnets **already within ~10.8% of the min** (the bottom
   cluster) are reachable; a healthy subnet is out of reach. Pure griefing (no profit) / self-protection via the long
   mirror; immunity ~180 days; pre-launch. Fix: select the prune victim on a longer-horizon / robust price, with hysteresis.
-- **F-06 — Unguarded terminal equity transfer can silently burn a trader's payout (LOW, pre-launch).** In
+- **F-06 — Unguarded terminal equity transfer can silently burn a trader's payout (LOW→MEDIUM, pre-launch).** In
   `settle_shorts_on_dereg` the equity payout is fire-and-forget — `let _ = Self::transfer_tao(&custody, &coldkey,
   equity.into())` ([mod.rs L769-772]) with no `.is_ok()` check (unlike the escrow-restore credit at [mod.rs L754-759],
   which *is* guarded) — and any custody remainder is then swept to issuance by `recycle_custody_tao(&custody,
   TaoBalance::MAX)` ([mod.rs L784]). If the transfer fails (destination coldkey left below the existential deposit, or
   dust-empty), the equity is **not paid and is then burned** by the sweep — a silent loss of funds the trader was owed.
-  Reachability is narrow (a trader normally holds a funded coldkey — they posted `P` from it — so the transfer fails
-  only in an ED-edge state; dereg-gated; pre-launch), which is why both adversarial verifiers noted the code path but
-  declined to promote it above LOW. Fix: settle equity with an existence/ED-safe transfer, or on failure hold the
-  amount in a claimable ledger rather than letting the terminal sweep burn it.
+  **Worse, `ShortTerminalSettled { equity }` is emitted regardless of transfer success** ([mod.rs L775-780]): the
+  on-chain event asserts a payment that did not happen, corrupting off-chain reconciliation. batch-08 held this LOW (the
+  burn itself is narrow — ED-edge, dereg-gated, pre-launch, no third-party profit); the independent code review (which
+  rates it HIGH, 3 reviewers incl. security) adds the event-integrity dimension, so we raise it to **LOW→MEDIUM**. Fix:
+  cap equity to transferable custody / hold unpaid equity in a refundable ledger, and emit only the amount transferred.
 
 ---
 
@@ -308,14 +323,97 @@ recovered principal counted as profit); after fixing the measurement (init befor
 Two separate harnesses hitting and self-correcting the same artifact is the exact "don't claim a leak you didn't truly
 measure" discipline this review holds itself to.
 
-**Un-promoted observation.** `executable_price_ppb` uses the naive `T/A` spot price rather than the Balancer-weighted
-price ([mod.rs L802-811]); this is inert while weights are 0.5/0.5 but would make caller slippage bounds weight-unaware
-if F-01's precondition were ever armed — another reason F-01's fix should make the whole open/close/limit-price model
-weight-consistent, not merely clamp self-close.
+**Observation (now promoted to F-10).** `executable_price_ppb` uses the naive fee-less `T/A` spot price rather than the
+fee+weight-aware realized cost ([mod.rs L802-811]); this weakens `limit_price` protection more broadly than first
+thought — the fee gap bites even at 0.5/0.5. The independent code review promoted this to a MEDIUM correctness finding;
+we carry it as **F-10** in the cross-reference section below.
 
 **Process note.** The four agents shared one target checkout, so their PoC test files collided in the shared tree; each
 agent's work was preserved separately and the substantive findings are unaffected, but future parallel rounds should
 give each agent an isolated checkout (captured in `METHODOLOGY.md`).
+
+---
+
+## Cross-reference: independent full code review (2026-07-01)
+
+After the internal verification round, a separate **full-PR code review** (10 first-pass reviewers across four provider
+families + security / tests / maintainability / database specialists, evidence-adjudicated) was run over the entire
+#2764 diff (4 high / 14 medium / 12 low). Most of its volume is code-quality / testing / weight-benchmark / documentation
+work outside this report's economic + reachability scope (see "Out of scope" below); the security-relevant overlap is
+reconciled here. **Every item we adopt below was re-verified against the source ourselves** (code-level — these are
+structural/correctness defects, not economic PoCs). The review is archived in
+`batches/batch-09-external-review-reconciliation/`.
+
+### Independent corroboration
+- **F-03** (coldkey-swap orphaning) — independently hit; rated **HIGH**; adds that `cleanup_short_if_empty` can drop the
+  aggregate/active-set while a destination position still lives.
+- **F-06** (unguarded equity transfer) — independently hit and rated **HIGH** (see the event-integrity angle we adopt).
+- **F-02** (cold-EMA cold-start) — a reviewer observation confirms post-migration newly-created subnets still cold-start
+  by falling back to the live reserve.
+- **`executable_price_ppb`** and **D-chi-moot** — both corroborated (promoted / refined below).
+
+### New in-scope findings adopted (code-verified)
+
+**F-07 — Unbounded terminal settlement under a fixed dissolve weight (HIGH, pre-launch).**
+`settle_shorts_on_dereg` / `settle_longs_on_dereg` do `iter_prefix(netuid).collect()` and loop over **every** position
+(materialize + up to two `transfer_tao` + recycle each), while the `dissolve_network` dispatch carries a **fixed** weight
+(`reads(6)/writes(31)`, [dispatches.rs L1234-1236]) that does not scale with position count. Per-side caps clamp to
+`[1,4096]` ([mod.rs L892], [long.rs L555]) ⇒ up to ~8192 settlements in one dissolution block. A heavily-populated subnet
+can push dissolution past the block's real budget — a **liveness/DoS** on consensus-critical chain maintenance — and it
+composes with **F-05**: an attacker pre-stuffs a subnet with min-input positions, then forces it through the prune path.
+The authors deliberately capped at 4096/side ("so governance can't lift the dereg-settlement" cost) — a partial
+mitigation — but the fixed weight + unbounded loop remain a weight-accounting gap the PR body itself flags for
+incremental settlement. **This is the highest-severity item in the report** (liveness, not dormant-economic), though
+still pre-launch. Fix: paginated/incremental settlement, or benchmarked weight that scales with live position count.
+
+**F-08 — 1:1 exact-output fallback for non-dynamic pools in settlement (MEDIUM, pre-launch).**
+`sim_tao_in_for_alpha_out` / `sim_alpha_in_for_tao_out` return a non-market **1:1** cost for `mechanism ≠ 1`
+([impls.rs L412-418, L440-446]), and `settle_*_on_dereg` never re-assert the subnet is still dynamic. A position that
+survives a dynamic→legacy mechanism transition would have its terminal cover/equity valued off 1:1 — a potential unbacked
+payout. Fix: define settlement for non-dynamic pools; don't silently value derivative liabilities at 1:1.
+
+**F-09 — Long terminal equity realized asymmetrically as Alpha stake (LOW–MEDIUM, pre-launch).**
+`settle_longs_on_dereg` credits long terminal equity as **minted Alpha stake** (`increase_stake_for_hotkey_and_coldkey_on_subnet`
++ `SubnetAlphaOut`, [long.rs L519-523]), then `destroy_alpha_in_out_stakes` distributes the pot pro-rata — whereas shorts
+pay **TAO** directly from custody. The asymmetry can dilute/under-realize the computed equity once the pot is distributed;
+no test asserts the final TAO-equivalent through destruction. (Because longs *mint* stake — a can't-fail credit — the
+F-06 burn does **not** apply to the long side; the long-side risk is dilution, not silent loss.) Fix: document the
+asymmetric terminal semantics, or settle long equity through a TAO-equivalent-preserving mechanism.
+
+**F-10 — `limit_price` binds the fee-less raw spot, not the realized price (LOW, pre-launch).**
+`ensure_price_at_least/at_most` use `executable_price_ppb` — a fee-less raw `SubnetTAO/SubnetAlphaIn` ratio
+([mod.rs L804-811]) — while close-cost quotes route through the fee- and weight-aware engine (`SimSwapOpts::WITH_FEES`).
+So `limit_price` can pass while the fee/weight-aware realized price is outside the intended bound: weaker MEV/sandwich
+protection than the parameter implies, **even at 0.5/0.5** (the fee gap alone). Fix: enforce `limit_price` against the
+engine quote / post-trade effective price. Couples to F-01's fix.
+
+### Reconciliations (our DEFENDED verdicts stand; hardening framing adopted)
+- **C-rollback (review HIGH "late checks after mutations"):** our `slippage_failure_rolls_back_state` test confirms the
+  probed open/close paths *do* roll back — but only via the **implicit** FRAME extrinsic-rollback guarantee; the dispatch
+  wrappers are not `#[transactional]` and the repo uses explicit transactions elsewhere. We concur: the current behavior
+  is safe, but the missing explicit transaction boundary is a real, undocumented fragility (breaks for any future
+  non-extrinsic caller). Fix: wrap each multi-step transition in `#[transactional]`/`with_transaction`, checks-first.
+- **C-atomicity (review accuracy edges):** our solvency verdict stands (custody ≥ Σ obligations; no theft/insolvency),
+  but the review correctly flags two accounting-**accuracy** edges on failure paths: `run_short_decay` commits the
+  aggregate decrement *before* the restoration transfer (understates the aggregate if the transfer fails), and
+  `recycle_custody_tao` decrements `TotalIssuance` *before* an unchecked `Exact` withdraw (a non-balance failure —
+  lock/hold/hook — could desync issuance vs balances). Neither is a drain; both are hardening. Fix: transfer/withdraw
+  first, commit accounting only on realized success.
+- **D-chi-moot (χ default vs docs):** our conclusion holds — the flow→emissions channel is **dead** (`get_shares` uses
+  only `get_shares_price_ema`; `get_shares_flow`/`get_ema_flow` are `#[allow(dead_code)]`/uncalled). The review adds a
+  valid caveat we now record: `DerivativeFlowFactor` **defaults to `1.0`** ([lib.rs L1457]), so derivatives *do* write
+  `SubnetTaoFlow` by default — a non-neutral write that contradicts DESIGN.md's "flow-neutral by default." It is inert
+  only because the readers are dead code; it **arms latently** the instant the flow-based emission path is ever wired.
+  Fix: default χ to 0, or reconcile the docs and gate enablement on an explicit χ acknowledgment.
+
+### Out of scope (acknowledged, not absorbed)
+The remaining ~16 review findings are code-quality / testing-coverage / weight-benchmark / documentation items —
+placeholder extrinsic weights without benchmarks, migration weight miscounting, untested slippage-guard / EMA-tick /
+migration paths, partial-close `last_active` grace, decay-dust bounds, `A_EMA` saturation, duplicated `BLOCKS_PER_DAY`,
+zero-count storage bloat, review-loop ID leakage in test comments, a stale `IMPLEMENTATION_PLAN.md`, the speculative
+`SimSwapOpts` wrapper, and the dormant long-side launch-scope question. They are legitimate and worth fixing but sit
+outside this report's economic / reachability mandate; they are catalogued in the review itself (archived under
+`batches/batch-09-external-review-reconciliation/`).
 
 ---
 
